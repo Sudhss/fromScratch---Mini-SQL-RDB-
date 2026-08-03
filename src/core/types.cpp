@@ -128,4 +128,4 @@ int TableSchema::primaryKeyIndex() const {
     return -1;
 }
 
-} // namespace minidb
+}

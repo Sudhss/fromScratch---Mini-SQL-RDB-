@@ -1,5 +1,5 @@
 #include "ui/status_bar.h"
-#include "theme/theme.h"
+#include "ui/theme.h"
 #include <QHBoxLayout>
 
 namespace minidb {

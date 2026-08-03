@@ -82,8 +82,10 @@ if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES
         WIN32_EXECUTABLE TRUE
     )
-    # Allow console output for CLI mode
-    target_link_options(${PROJECT_NAME} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+    # Allow console output for CLI mode (MSVC only)
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+    endif()
 endif()
 
 # ── Source Groups (IDE organization) ───────────────────────────────────

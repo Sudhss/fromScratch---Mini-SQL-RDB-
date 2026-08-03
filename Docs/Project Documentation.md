@@ -1,0 +1,647 @@
+# Mini SQL RDB: Comprehensive Architectural Documentation
+
+This document serves as the exhaustive architectural guide and design rationale behind the Mini SQL Relational Database (MiniSQL RDB) built from scratch in C++ and Qt6. Every subsystem, design choice, and algorithmic implementation is discussed in deep detail to answer not just *what* was built, but *how* and *why* it was built that way.
+
+---
+
+## 1. System Overview
+
+The MiniSQL RDB is a standalone, embedded relational database management system. It does not rely on any third-party database libraries (like SQLite) or parser generators (like Flex/Bison). The entire stack—from parsing text to flushing bytes to disk—is custom-built. 
+
+### 1.1 Core Components
+
+1. **Storage Engine**: Manages disk I/O, page allocation, buffer pooling, and binary layout of records.
+2. **SQL Frontend**: A hand-written Lexer and Recursive Descent Parser that transforms raw SQL strings into an Abstract Syntax Tree (AST).
+3. **Query Engine**: A Volcano-style iterator model executor that plans queries and evaluates expressions.
+4. **GUI / UI Layer**: A Qt6-based Integrated Development Environment (IDE) featuring a syntax-highlighted editor, schema explorer, and results grid, alongside a CLI mode.
+
+---
+
+## 2. Storage Engine Architecture
+
+The Storage Engine is the lowest layer of the database. Its primary responsibility is durability and efficient retrieval of data from the underlying `.minidb` file. Real databases do not write arbitrary variable-length strings sequentially to disk; they manage data in fixed-size chunks called **Pages**.
+
+### 2.1 The Page Layout (Slotted Pages)
+
+**Why fixed-size pages?** 
+Operating systems and storage devices read and write data in blocks (typically 4KB or 8KB). By aligning our database pages to the OS page size (4096 bytes), we minimize I/O overhead and prevent fragmentation.
+
+**How is a page structured?**
+We use the **Slotted Page Architecture**. This is the industry standard (used by PostgreSQL, SQLite, and InnoDB) for storing variable-length records (like `VARCHAR`).
+
+```cpp
+constexpr uint32_t PAGE_SIZE = 4096;
+constexpr uint32_t PAGE_HEADER_SIZE = 16;
+constexpr uint32_t SLOT_SIZE = 4; // 2 bytes offset, 2 bytes length
+```
+
+A slotted page is divided into three sections:
+1. **Header (16 bytes)**: Stores the `pageType`, `recordCount`, pointers to the start and end of the free space, and a `nextPageId` for linking pages together.
+2. **Slot Array**: An array of `[offset, length]` pairs that grows *downwards* from the end of the header. Each slot points to a specific record in the page.
+3. **Record Data**: The actual binary rows, which grow *upwards* from the very end of the page (byte 4095).
+
+**Why this layout?**
+If records were simply appended back-to-back, deleting a 50-byte record in the middle of a page would leave a 50-byte "hole". Shifting all subsequent records to fill the hole would change their physical offsets, invalidating any index pointers to those records. 
+With slotted pages, an index only stores the `(PageID, SlotIndex)`. If a record is shifted during defragmentation, only the 2-byte offset in the slot array needs to be updated. External index pointers remain valid.
+
+### 2.2 The Buffer Pool (Pager)
+
+**Why not read from disk on every query?**
+Disk I/O is orders of magnitude slower than memory access. The database must cache recently used pages in memory.
+
+**How does it work?**
+The `Pager` class acts as a Buffer Pool Manager. It maintains a cache of `Page` objects. When the executor requests `readPage(5)`, the Pager:
+1. Checks the in-memory cache (a `QHash<uint32_t, CacheEntry>`).
+2. If found (Cache Hit), returns the page immediately.
+3. If not found (Cache Miss), allocates a buffer, reads exactly 4096 bytes from `QFile` at offset `5 * 4096`, and inserts it into the cache.
+
+**Eviction Policy (LRU):**
+The cache has a maximum capacity (e.g., 256 pages = 1MB). When full, the Pager uses a Least Recently Used (LRU) policy via a `QLinkedList` to evict the oldest, unaccessed page. If the evicted page is marked "dirty" (modified), it is synchronously flushed to disk before being removed from memory.
+
+### 2.3 Row Serialization and Record Format
+
+**Why a custom binary format?**
+Text formats (like CSV or JSON) require expensive parsing and converting string representations to integers on every read. Binary formats are compact and can be mapped directly to CPU registers.
+
+**How are rows serialized?**
+The `RecordSerializer` takes a `Row` (a vector of `Value` variants) and a `TableSchema` and produces a `QByteArray`.
+1. **Null Bitmap**: The first bytes of a record are a bitmap (1 bit per column). If a bit is set, the column is `NULL`, and takes up 0 bytes in the data section.
+2. **Data Section**: 
+   - `INT` and `DATE`: 4 bytes, Big-Endian.
+   - `FLOAT`: 8 bytes, IEEE 754 standard.
+   - `BOOL`: 1 byte (0x00 or 0x01).
+   - `VARCHAR`: A 2-byte length prefix followed by UTF-8 bytes. (Null-terminators are not used, saving 1 byte per string and allowing fast length lookups).
+
+### 2.4 Heap Files (Tables)
+
+Tables are organized as **Heap Files**—a collection of unordered data pages. Because pages are fixed at 4KB, a single table will span multiple pages. The pages are connected via a singly-linked list using the `nextPageId` in the page header.
+
+When `INSERT INTO` is called:
+1. The `Table` class requests the first page from the `Pager`.
+2. It attempts to insert the serialized record.
+3. If the page returns `-1` (no space), the Table traverses the `nextPageId` link.
+4. If it reaches the end of the list, it asks the Pager to `allocatePage()`, links it, and inserts the record there.
+
+### 2.5 Indexing: B+Tree Implementation
+
+**Why B+Tree instead of a Hash Index or Binary Search Tree?**
+- BSTs can become unbalanced (O(N) search) and their node pointers cause severe disk thrashing (random I/O).
+- Hash Indexes only support equality lookups (`WHERE id = 5`), not range scans (`WHERE id BETWEEN 5 AND 10`).
+- A B+Tree is shallow (usually 3-4 levels deep even for billions of rows), perfectly aligned to 4KB pages, and supports both point lookups and range scans.
+
+**How is the B+Tree structured?**
+- **Internal Nodes**: Store only routing keys and pointers (Page IDs) to child pages. Because they don't store row data, a 4KB page can hold hundreds of routing keys, leading to massive fan-out.
+- **Leaf Nodes**: Store the actual keys and the `RowId` (PageID + SlotIndex). Crucially, leaf nodes have `next_leaf_page` pointers, creating a doubly-linked list at the bottom. 
+- **Range Scans**: To execute `SELECT * WHERE id > 100`, the database searches the tree to find `100`, then simply traverses the linked list of leaf pages rightward, without ever traversing back up the tree.
+
+---
+
+## 3. SQL Frontend Architecture
+
+The SQL Frontend is responsible for understanding human-readable SQL and converting it into a machine-executable Abstract Syntax Tree (AST).
+
+### 3.1 Lexer (Tokenizer)
+
+The Lexer scans the raw SQL string character-by-character. It groups characters into logical `Token` units.
+
+**Design Choices:**
+- **Hand-written State Machine**: Instead of using Regex (which is slow and hard to debug for complex parsing), we use a switch-case state machine reading a `QString`.
+- **Lookahead**: When the lexer sees `<`, it peeks at the next character. If it's `=`, it emits `LESS_THAN_EQUALS`; if `>` it emits `NOT_EQUALS`; otherwise it emits `LESS_THAN`.
+- **String Literals**: Handled cleanly by scanning until the matching closing quote, escaping embedded quotes.
+
+### 3.2 Recursive Descent Parser
+
+**Why Recursive Descent?**
+Parser generators (Yacc/Bison) generate unreadable C code and provide notoriously bad error messages ("Syntax error near token"). A hand-written Recursive Descent parser allows us to throw precise exceptions: "Parse error at line 2 col 15: Expected 'INTO' after 'INSERT'".
+
+**How it works:**
+The parser consists of mutually recursive functions for every non-terminal in the SQL grammar: `parseStatement()`, `parseSelect()`, `parseWhereClause()`, etc.
+
+```cpp
+std::unique_ptr<Statement> Parser::parseSelect() {
+    expect(TokenType::SELECT);
+    auto columns = parseSelectColumnList();
+    expect(TokenType::FROM);
+    auto table = parseTableRef();
+    // ...
+}
+```
+
+### 3.3 Pratt Parsing for Expressions (Precedence Climbing)
+
+Parsing expressions like `A + B * C = D OR E IS NULL` is extremely complex due to operator precedence. Recursive descent struggles here without creating deeply nested, redundant functions.
+
+**How Pratt Parsing Solves This:**
+We associate a "binding power" (precedence level) with every operator. 
+- `*` has power 60
+- `+` has power 50
+- `=` has power 40
+- `AND` has power 30
+- `OR` has power 20
+
+The `parseExpression(precedence)` function loops, consuming tokens as long as their binding power is strictly greater than the current context. This cleanly builds a correct AST where `*` binds tighter than `+`.
+
+---
+
+## 4. Query Engine Architecture
+
+Once the AST is built, it must be executed. MiniSQL RDB uses the **Volcano Iterator Model**.
+
+### 4.1 The Planner
+
+The Planner acts as the bridge between the AST and the Executor. Currently, it is a **rule-based optimizer**.
+- **Index Lookups**: If the AST contains a `WhereClause` with a `BinaryExpr` utilizing the `EQUALS` operator against a `PRIMARY KEY` column, the Planner outputs a `QueryPlan` setting `scanType = INDEX_LOOKUP`.
+- **Full Table Scans**: If the condition does not hit an index, it defaults to `FULL_SCAN`.
+
+### 4.2 The Evaluator
+
+The `Evaluator` is a stateless engine that evaluates an `Expression` AST node against a specific `Row`.
+
+**NULL Propagation Logic:**
+Database logic uses Three-Valued Logic (True, False, Unknown/Null). The Evaluator carefully enforces this:
+- `5 + NULL = NULL`
+- `TRUE AND NULL = NULL`
+- `FALSE AND NULL = FALSE` (Short-circuiting)
+- `NULL = NULL` is `NULL`, not `TRUE`. (This is why `IS NULL` exists).
+
+**LIKE Pattern Matching:**
+Handled via a recursive backtracking algorithm. `%` branches into two recursive calls: one consuming the wildcard, and one consuming the character but keeping the wildcard.
+
+### 4.3 The Executor
+
+The `Executor` orchestrates the pipeline. For a `SELECT` statement, it follows this strict logical sequence:
+1. **FROM & JOIN**: Resolves the base table. Iterates through the table via `TableIterator`. For `JOIN`s, it executes a Nested Loop Join (for every row in Table A, loop through Table B).
+2. **WHERE**: Passes the combined row to the `Evaluator`. If `evaluateCondition` returns false, the row is discarded.
+3. **GROUP BY & Aggregates**: Sorts or hashes the rows into groups. For each group, it evaluates aggregate functions (`COUNT`, `SUM`).
+4. **HAVING**: Filters the aggregated groups.
+5. **ORDER BY**: Uses `std::sort` with a custom lambda that evaluates the `ORDER BY` expression for two rows and compares the resulting `Value` objects.
+6. **SELECT (Projection)**: Evaluates the specific columns requested in the output.
+7. **LIMIT**: Truncates the final result set.
+
+The output is packed into a `QueryResult` object, which is totally detached from the storage engine, allowing the GUI to render it safely.
+
+---
+
+## 5. Qt Integration & GUI Architecture
+
+The user interfaces with the database either via a command-line interface or a rich Qt6 IDE.
+
+### 5.1 Clean Separation of Concerns
+
+The GUI layer (`src/ui/`) is entirely decoupled from the database internals. The only connection point is the `Database::execute(QString sql)` method. The UI sends a string, and receives a `QueryResult`. The UI knows nothing about slotted pages or AST nodes.
+
+### 5.2 Model-View Architecture
+
+The `ResultsTable` widget leverages Qt's Model/View architecture. 
+Instead of creating thousands of `QTableWidgetItem` objects (which consumes massive memory and CPU), we implemented a custom `QAbstractTableModel` (`ResultsTableModel`). 
+This model holds a reference to the `QueryResult` and overrides `data(index, role)`. Qt only asks the model for data for the cells currently visible on screen. This allows the database to instantly display a result set of 100,000 rows without any UI freezing.
+
+### 5.3 Syntax Highlighting
+
+The `SqlHighlighter` inherits from `QSyntaxHighlighter`. It attaches to the `QTextDocument` of the `QueryEditor`. As the user types, Qt triggers a re-highlight of the changed block. We use `QRegularExpression` matching to rapidly apply Catppuccin color formats to SQL keywords, strings, and comments, providing an instant visual feedback loop.
+
+---
+
+## 6. Design Constraints and Future Work
+
+As a "Mini" RDB, certain compromises were made for educational clarity and scope constraint:
+
+1. **Transactions (ACID)**: Version 1 implements durability via `flushAll()`, but does not implement a Write-Ahead Log (WAL) or undo/redo logs. Therefore, it lacks Atomicity and Isolation guarantees during concurrent access or sudden power failure. 
+2. **Concurrency**: The database is single-threaded. Multiple queries execute serially. A future version would introduce `QReadWriteLock` on the Pager to allow concurrent reads and exclusive writes.
+3. **Cost-Based Optimization**: The query planner is rule-based. It does not gather table statistics (cardinality, histograms) to make dynamic join-order decisions.
+
+## Summary
+
+The MiniSQL RDB demonstrates a massive vertical slice of computer science disciplines:
+- **Systems Programming**: Managing disk I/O, raw binary buffers, and memory caches.
+- **Compiler Theory**: Lexical analysis, context-free grammars, and abstract syntax trees.
+- **Algorithms**: B+Tree traversal, Nested Loop Joins, and recursive pattern matching.
+- **UI/UX**: Asynchronous data models, syntax highlighting, and responsive desktop application design.
+# Mini SQL Relational Database: 50 Comprehensive Interview Questions and Answers
+
+This document details the architecture, design decisions, and implementation details of the Mini SQL Relational Database. It is structured into multiple categories reflecting the core components of the system: Storage Engine, Buffer Pool, Lexer/Parser, Query Execution, Indexing, Concurrency, and Qt6 GUI.
+
+---
+
+## Part 1: Storage Engine and Heap File Organization
+
+### Q1: Why did you choose a 4KB slotted page architecture for the storage engine instead of fixed-length arrays or continuous byte streams?
+**Answer:**
+A continuous byte stream or fixed-length array is intuitive but completely impractical for a relational database that must support variable-length strings (e.g., `VARCHAR`) and efficient deletions. 
+1. **Disk I/O Alignment:** Disk drives and OS file systems operate on blocks (traditionally 4KB). Reading or writing arbitrary byte streams leads to unaligned I/O, which is severely detrimental to performance. By adopting a 4KB page size, our database I/O aligns perfectly with the underlying OS page cache and SSD block sizes.
+2. **Variable Length Data:** Fixed-length arrays waste massive amounts of space. If a `VARCHAR(255)` column stores the string "Hi", a fixed array pads the remaining 253 bytes. A slotted page, however, separates the logical layout from the physical layout. The page header contains an array of "slots" (pointers to the end of the page where the actual data resides). This allows records of any size to be packed tightly without wasting space.
+3. **Indirection and Defragmentation:** Slotted pages provide a level of indirection. A Record ID (RID) is structured as `(PageID, SlotIndex)`. When a record is updated or deleted, it might change size. The storage engine can physically move the record within the 4KB page to defragment space without altering the `SlotIndex`. Thus, external indexes (like our B+Tree) that rely on the RID do not need to be updated.
+
+### Q2: How exactly does the slotted page architecture manage variable-length records and internal fragmentation?
+**Answer:**
+The slotted page is divided into three logical zones: the Header, the Slot Array, and the Data Payload area.
+*   **Header (Fixed Size):** Contains metadata such as `PageID`, `NextPageID`, `PrevPageID`, `FreeSpacePointer`, and `SlotCount`.
+*   **Slot Array (Grows forward):** Located immediately after the header. Each entry is typically a 4-byte integer: 2 bytes for the offset of the record from the start of the page, and 2 bytes for the length of the record.
+*   **Data Payload (Grows backward):** Actual tuples are inserted starting from the *end* (byte 4096) of the page and growing towards the center.
+
+When a tuple is inserted, the system checks if the gap between the end of the slot array and the `FreeSpacePointer` is large enough to hold the new slot entry (4 bytes) plus the tuple's size. If it is, the `FreeSpacePointer` is decremented by the tuple size, the tuple data is copied there, and a new slot is added.
+
+**Defragmentation:** When tuples are deleted, their slot entries are marked as invalid (e.g., offset set to -1). The physical space in the payload area becomes a "hole". The page can be compacted by shifting valid tuples towards the end of the page, updating their slot offsets, and reclaiming the continuous free space in the middle.
+
+### Q3: How are Record IDs (RIDs) structured, and how do they map to physical disk locations?
+**Answer:**
+An RID uniquely identifies a row in a table. In our architecture, an RID is a 64-bit integer, conceptually broken down into two components:
+*   **PageID (32-bit):** Identifies the specific 4KB page within the database file.
+*   **SlotIndex (32-bit):** Identifies the slot array index within that page.
+
+**Mapping to Physical Location:**
+To locate a record on disk:
+1.  The `PageID` is multiplied by the page size (4096). This gives the absolute byte offset of the page within the `.db` file (e.g., Page 5 is at offset `5 * 4096 = 20480`).
+2.  The Buffer Pool Manager fetches this 4KB page into memory.
+3.  The Storage Engine accesses the page's memory buffer. It looks up the slot array at `SlotIndex`.
+4.  The slot provides the internal `Offset` and `Length`.
+5.  The actual tuple data is located at `BufferStart + Offset`.
+
+### Q4: What happens when a slotted page becomes completely full during an `INSERT` operation?
+**Answer:**
+This triggers the allocation of a new page. The table is structured as a doubly-linked list of pages (Heap File). 
+1.  The current page realizes it lacks sufficient free space.
+2.  It requests a new page from the Disk Manager. The Disk Manager expands the file by 4KB, returning a new `PageID`.
+3.  The Buffer Pool brings this new, empty page into memory.
+4.  The Storage Engine formats it as a slotted page, setting up its header.
+5.  The `NextPageID` of the old page is updated to point to the new `PageID`, and the `PrevPageID` of the new page points to the old page.
+6.  The insertion is retried on the new page.
+
+### Q5: Why use a Heap File organization for table data instead of storing all data directly within the B+Tree (Clustered Index)?
+**Answer:**
+We chose an unclustered heap file organization primarily to simplify implementation and separate concerns:
+1.  **Simplicity of B+Tree:** Implementing a fully functional B+Tree is extremely complex (handling splits, merges, borrowing). If the B+Tree only stores `(Key, RID)` pairs instead of `(Key, Entire Tuple)`, the size of the values is strictly fixed (e.g., 4 bytes for Key + 8 bytes for RID). This prevents massive node splits that happen when storing large `VARCHAR` payloads inside tree nodes.
+2.  **Multiple Indexes:** In a heap file, the table data resides in one place. If we add secondary indexes later, they all point to the same static `RID`. If we used a clustered B+Tree, moving a record to maintain sort order would change its physical location, forcing updates to all secondary indexes.
+3.  **Sequential Scans:** A heap file allows for very fast sequential scans (`SELECT * FROM table WHERE non_indexed_col = val`). We simply traverse the linked list of pages.
+
+### Q6: How does the system track free space across the entire heap file?
+**Answer:**
+We implement a Free Space Map (FSM) at the beginning of the table's file, or we maintain a "Directory Page".
+Instead of scanning every page linearly to find one with enough room for a 500-byte insertion, the Directory Page holds an array of records: `[PageID, MaxFreeSpace]`. 
+When an insert occurs, the engine scans the Directory Page (which is cached in memory) to quickly find a `PageID` that has at least 500 bytes of free space. If none exist, a new page is allocated and added to the directory.
+
+### Q7: Describe the serialization format of a Tuple before it is written to the page.
+**Answer:**
+A Tuple is an ordered collection of values. Because of variable-length strings, a tuple must serialize itself into a byte array.
+The format is: `[Null Bitmap] [Fixed-Length Columns] [Variable-Length Offsets] [Variable-Length Data]`
+*   **Null Bitmap:** If a table has 8 columns, 1 byte is used to indicate which columns are NULL. This saves space compared to writing a specific "null marker" per field.
+*   **Fixed-Length Columns:** `INT`, `BOOLEAN`, `FLOAT` are written directly after the bitmap.
+*   **Offsets:** For `VARCHAR`, we store a 2-byte offset pointing to the end of the tuple where the string is actually stored, followed by the string itself.
+
+### Q8: How does the storage engine handle records that exceed the 4KB page size (Overflow Pages)?
+**Answer:**
+If a user attempts to insert a row that serializes to 6KB, it cannot fit in a standard slotted page. We handle this using Overflow Pages.
+1.  The main slotted page will store a special "Tombstone" or "Forwarding Pointer" in the slot array.
+2.  This pointer directs the engine to a sequence of dedicated `Overflow Pages` allocated solely for this massive record.
+3.  The Disk Manager allocates two contiguous 4KB pages. The tuple is written across them.
+4.  When retrieving the tuple, the engine sees the overflow flag in the slot, follows the pointer, and reconstructs the byte array from the overflow pages.
+
+### Q9: What is the physical layout of the overall `.db` file? Is there a header page?
+**Answer:**
+Yes, Page 0 is reserved as the Database Header Page (or Meta Page).
+It contains:
+*   A magic string (e.g., `MINISQL_V1`) for file validation.
+*   The page size (4096).
+*   The total number of pages allocated.
+*   A pointer (PageID) to the system catalog (schema table).
+*   A pointer to the root of the B+Tree indexes.
+Starting from Page 1, pages are either B+Tree nodes, Heap File pages, or Directory pages.
+
+### Q10: How do you handle sudden crash scenarios to prevent page corruption during a write?
+**Answer:**
+While we don't implement a full Write-Ahead Log (WAL) in this mini version, we ensure page writes are atomic at the OS level (POSIX `pwrite`). However, a crash during a multi-page operation (like a B+Tree split) can cause inconsistency. We mitigate this using a rudimentary "Shadow Paging" concept for critical schema updates, or we rely on explicit `fsync` calls after completing logical operations before confirming to the user.
+
+---
+
+## Part 2: Buffer Pool Manager
+
+### Q11: What is the primary role of the Buffer Pool Manager, and why not let the OS handle caching?
+**Answer:**
+The Buffer Pool Manager (BPM) acts as a middleman between the Disk Manager and the Query Engine. It holds a fixed number of 4KB pages in RAM.
+While the OS has its own page cache, relying on it is problematic for a DBMS:
+1.  **Eviction Control:** The OS uses generic algorithms (like LRU) that are unaware of database queries. For example, during a sequential scan, the OS might evict index nodes to cache the table data. A DBMS knows that index root nodes should *never* be evicted.
+2.  **Pinning:** The DBMS needs to "pin" a page in memory to guarantee it won't be swapped out while a thread is actively modifying its memory buffer. The OS cannot provide this guarantee at the user-space level.
+3.  **Write-Ahead Logging (WAL):** A true DBMS must ensure that log records are flushed to disk *before* the modified page is flushed. We must control the exact moment a dirty page is written to disk.
+
+### Q12: How is the LRU (Least Recently Used) cache implemented efficiently in C++?
+**Answer:**
+We use a combination of `std::unordered_map` and a `std::list` (doubly-linked list).
+*   `std::list<PageID> lru_list;` keeps track of the recency of pages. The most recently used page is at the front; the least recently used is at the back.
+*   `std::unordered_map<PageID, std::list<PageID>::iterator> page_table;` provides $O(1)$ lookup to find where a page sits in the linked list and where its actual memory frame is located.
+
+When a page is accessed:
+1. We check the `page_table`.
+2. If it exists, we move the node in `lru_list` to the front (using `std::list::splice` for $O(1)$ movement).
+3. If it doesn't exist, we fetch from disk, potentially evicting the page at the back of `lru_list` if the pool is full.
+
+### Q13: Explain the concept of "Pinning" and "Unpinning" a page. Why is it necessary?
+**Answer:**
+Pinning is a reference counting mechanism. A `PinCount` integer is associated with every page frame in the buffer pool.
+When the Query Engine requests a page (`FetchPage(page_id)`), the BPM increments the `PinCount`.
+As long as `PinCount > 0`, the page is "pinned" and **cannot be chosen for eviction** by the LRU algorithm, even if it is the least recently used.
+This prevents a catastrophic scenario where the engine is midway through writing a tuple into a page's memory buffer, and the BPM decides to evict it, writing a half-finished tuple to disk and replacing the memory frame with a different page.
+Once the engine is done, it calls `UnpinPage(page_id)`. When `PinCount` reaches 0, it becomes a candidate for eviction.
+
+### Q14: How does the Buffer Pool distinguish between clean and dirty pages, and how does this affect eviction?
+**Answer:**
+Each frame has a boolean `is_dirty` flag. 
+When the engine modifies a page, it must pass a flag to `UnpinPage(page_id, is_dirty=true)`.
+If a page is clean (`is_dirty == false`), evicting it is virtually free; the BPM simply discards the memory contents and loads a new page from disk.
+If a page is dirty, the BPM must first synchronously issue a disk write to save the modified 4KB block back to the `.db` file before it can reuse that memory frame. This makes evicting dirty pages expensive.
+
+### Q15: What happens if the Buffer Pool is completely full, and every single page is pinned?
+**Answer:**
+This is a state of "Buffer Pool Exhaustion". If a query attempts to fetch a new page, the BPM will scan the LRU list and find no unpinned pages.
+The system will throw an exception or return an error indicating that the query requires too much concurrent memory. To prevent this, query operators are strictly designed to process data iteratively (Volcano model) and unpin pages immediately after reading the necessary tuple, rather than trying to hold the entire table in memory at once.
+
+### Q16: How do you handle concurrency within the Buffer Pool Manager?
+**Answer:**
+The Buffer Pool is a massive shared resource. We use a global `std::mutex` (or a `std::shared_mutex` for read/write locking) to protect the internal `unordered_map` and `list` structures.
+When a thread requests a page, it acquires the mutex, updates the LRU pointers, increments the pin count, and releases the mutex. 
+To optimize, we don't hold the global lock while performing the actual disk I/O. We mark the frame as "loading", release the global lock, perform the `pread()`, and then lock the specific frame so other threads wait only for that specific I/O, not blocking access to already-cached pages.
+
+### Q17: Could you explain the Clock replacement policy, and why you chose LRU over it?
+**Answer:**
+The Clock algorithm is an approximation of LRU. It uses a circular array of frames and a "clock hand". Each frame has a reference bit. When accessed, the bit is set to 1. The clock hand sweeps the array, clearing 1s to 0s, and evicting the first frame it finds with a 0.
+While Clock is more memory efficient (avoids linked list overhead) and has less locking overhead, we chose exact LRU because our mini-database buffer pool is relatively small (e.g., 1024 pages / 4MB). The overhead of `std::list` is negligible at this scale, and precise recency tracking provides marginally better hit rates for certain query access patterns.
+
+### Q18: How does the Buffer Pool Manager interface with the underlying OS file system in C++?
+**Answer:**
+We abstract this into a `DiskManager` class. It uses POSIX system calls (`open`, `pread`, `pwrite`, `lseek`, `fsync`) rather than C++ streams (`std::fstream`), because C++ streams introduce their own internal buffering which we explicitly want to avoid. We want raw access to the file.
+```cpp
+void DiskManager::ReadPage(page_id_t page_id, char* page_data) {
+    int offset = page_id * PAGE_SIZE;
+    pread(db_fd_, page_data, PAGE_SIZE, offset);
+}
+```
+
+---
+
+## Part 3: Lexer and Recursive Descent Parser
+
+### Q19: Why write a custom Lexer and Parser from scratch instead of using tools like Bison/Flex or ANTLR?
+**Answer:**
+Writing them from scratch in C++ was a deliberate architectural choice for educational depth and dependency management.
+1.  **No External Dependencies:** We avoid pulling in heavy runtime libraries or requiring a code-generation step in the build system (CMake). The engine compiles cleanly with standard C++17.
+2.  **Custom Error Handling:** Tools like YACC often produce cryptic "syntax error at token X" messages. By hand-writing the parser, we maintain precise context. If a user types `SELECT * FRM table`, our parser knows it just successfully parsed the SELECT list and is explicitly looking for the `FROM` keyword, allowing us to emit highly specific errors: `"Expected 'FROM' after select list, found 'FRM'."`
+3.  **Qt Integration:** We need the Lexer to also power the Syntax Highlighting in the Qt GUI. A hand-written tokenizer is much easier to adapt into a `QSyntaxHighlighter` than an opaque Flex scanner.
+
+### Q20: How is the Lexer (Tokenizer) implemented? Describe the state machine.
+**Answer:**
+The Lexer iterates through the raw SQL string character by character.
+It uses a `switch` statement based on the current character:
+*   If `isalpha(c)`, it enters an identifier/keyword state, consuming characters until a space or symbol is found. It then checks against a hash set of reserved keywords (`SELECT`, `INSERT`, `WHERE`) to categorize the token as `TokenType::KEYWORD` or `TokenType::IDENTIFIER`.
+*   If `isdigit(c)`, it enters a numeric state, checking for decimal points to distinguish between `INT` and `FLOAT` literals.
+*   If `c == '\''`, it enters a string literal state, accumulating characters until the closing quote is found.
+It returns a `std::vector<Token>` where each token contains the type, string value, and the line/column number for precise error reporting.
+
+### Q21: What is a Recursive Descent Parser, and how does it construct an Abstract Syntax Tree (AST)?
+**Answer:**
+A Recursive Descent Parser is a top-down parser built using a set of mutually recursive functions, where each function corresponds to a grammar rule in our SQL dialect.
+For example, we have a function `ASTNode* parseSelectStatement()`.
+Inside this function, we expect the current token to be `SELECT`. We consume it. Then we call `parseSelectList()` which returns child nodes representing the columns. Then we check for `FROM`, consume it, and call `parseTableRef()`. 
+As the functions call each other, they instantiate C++ structs (`SelectStatementNode`, `ColumnRefNode`, `BinaryOperatorNode`) and attach them as children, organically building a tree structure (the AST) that represents the query.
+
+### Q22: How does your parser handle operator precedence in the `WHERE` clause (e.g., `A = 5 AND B > 3 OR C = 1`)?
+**Answer:**
+We implement operator precedence using Pratt Parsing (or Precedence Climbing) within the recursive descent structure.
+We assign binding powers (precedence levels) to operators: `OR` (10), `AND` (20), `==, >, <` (30), `*, /` (40), `+, -` (50).
+The `parseExpression(int min_precedence)` function works by:
+1. Parsing a prefix expression (like a literal, identifier, or unary `-`).
+2. Looking at the next token (an infix operator).
+3. If the operator's precedence is greater than the `min_precedence`, we consume the operator and recursively call `parseExpression(operator_precedence)`.
+4. We combine the left side, the operator, and the right side into a `BinaryOperatorNode`.
+This elegantly ensures that `AND` binds tighter than `OR` without requiring deeply nested functions for every single operator level.
+
+### Q23: How do you represent the Abstract Syntax Tree (AST) in C++ memory, and how do you prevent memory leaks?
+**Answer:**
+The AST is a polymorphic tree. We have a base class `ASTNode` with a virtual destructor.
+We heavily utilize `std::unique_ptr<ASTNode>` to manage ownership.
+```cpp
+struct SelectStatementNode : public ASTNode {
+    std::vector<std::unique_ptr<ASTNode>> select_list;
+    std::unique_ptr<ASTNode> from_table;
+    std::unique_ptr<ASTNode> where_clause;
+};
+```
+When a parsing function succeeds, it returns a `std::unique_ptr`. When the root node (the parsed statement) goes out of scope, the destructor cascadingly deletes the entire tree, completely eliminating the risk of memory leaks, even if an exception is thrown midway through parsing.
+
+### Q24: What is the Binder phase, and why is it separate from the Parser?
+**Answer:**
+The Parser only understands syntax (grammar). It knows that `SELECT foo FROM bar` is structurally valid. However, it does not know if table `bar` exists, or if `foo` is a real column.
+The Binder (or Semantic Analyzer) traverses the AST and interacts with the System Catalog.
+It performs checks:
+1. Validates table existence.
+2. Validates column existence and resolves ambiguous column names.
+3. Performs type checking (e.g., preventing `string_col = 5`).
+The Binder transforms the raw string-based AST nodes into Bound Nodes that contain physical table IDs and exact data types. Separating parsing and binding keeps the code modular and allows the parser to be catalog-independent.
+
+### Q25: How does the parser handle complex nested subqueries?
+**Answer:**
+Because of the recursive nature of the parser, handling subqueries naturally falls out of the design. 
+When parsing an expression in a `WHERE` clause (e.g., `WHERE id IN (SELECT id FROM other)`), the parser encounters the `(` token, sees a `SELECT` token next, and recursively calls the top-level `parseSelectStatement()` function.
+The entire inner subquery is parsed into its own AST, which is then attached as a child node to the `IN` operator node in the parent tree.
+
+### Q26: Give an example of a common syntax error and exactly how the hand-written parser recovers or reports it.
+**Answer:**
+Consider: `CREATE TABLE users (id INT, name VARCHAR);` but the user forgets the closing parenthesis: `CREATE TABLE users (id INT, name VARCHAR ;`.
+In `parseCreateTable()`, the parser loops through column definitions. It expects a `,` or a `)`. It encounters a `;`.
+Instead of failing cryptically, the code explicitly states:
+```cpp
+if (match(TokenType::SEMICOLON)) {
+    throw ParserException("Expected ')' to close column definitions, but found ';'", current_token.line);
+}
+```
+Because we throw a specific exception carrying line and column data, the Qt GUI catches this and underlines the exact semicolon in red.
+
+---
+
+## Part 4: Query Execution Engine (Volcano Model)
+
+### Q27: Explain the Volcano (Iterator) model used in your execution engine. Why is it advantageous?
+**Answer:**
+The Volcano model is a pull-based execution strategy. Every physical operation in the database (SeqScan, IndexScan, Filter, HashJoin) inherits from a common `Executor` interface with three main methods: `Init()`, `Next()`, and `Close()`.
+The query plan forms a tree of executors. To execute a query, the system calls `Next()` on the root node.
+*   The root node (e.g., a Limit node) calls `Next()` on its child (e.g., a Filter node).
+*   The Filter node calls `Next()` on its child (e.g., a SeqScan node).
+*   The SeqScan reads one Tuple from the buffer pool and returns it up.
+**Advantages:**
+1.  **Pipelining:** Tuples stream upward one at a time. The engine doesn't need to load the entire table into memory before filtering it. This keeps memory overhead strictly bounded.
+2.  **Composability:** Because every operator shares the same interface, they can be stacked in any arbitrary tree without knowing what their children are doing.
+
+### Q28: How does the Sequential Scan (`SeqScanExecutor`) actually interact with the Storage Engine to fetch tuples?
+**Answer:**
+In its `Init()` method, the `SeqScanExecutor` looks up the root PageID of the target table.
+In the `Next()` method:
+1. It requests the current page from the Buffer Pool Manager and pins it.
+2. It iterates through the Slot Array of the page.
+3. For each valid slot, it extracts the tuple data into a `Tuple` object.
+4. If it reaches the end of the slot array, it unpins the current page, looks at the `NextPageID` in the page header, fetches the next page, and continues.
+5. It yields the Tuple upward. When `NextPageID` is -1 (EOF), it returns false.
+
+### Q29: How is the `FilterExecutor` (implementing the WHERE clause) designed?
+**Answer:**
+The `FilterExecutor` holds a child executor and an Abstract Expression Tree (representing the WHERE condition).
+When `Next()` is called, it loops:
+```cpp
+while (child_->Next(&tuple)) {
+    if (expression_tree_->Evaluate(tuple).GetAsBool()) {
+        return true; // Yield this tuple upward
+    }
+}
+return false;
+```
+The `Evaluate` function dynamically substitutes the column values from the current `tuple` into the expression tree (e.g., replacing a `ColumnRefNode` with the actual integer value from the tuple) and computes the boolean result.
+
+### Q30: Did you implement any Join algorithms? If so, explain Nested Loop Join vs. Hash Join.
+**Answer:**
+Yes, we implemented a Nested Loop Join (NLJ) as a baseline.
+An NLJ Executor has a left child and a right child. For every single tuple produced by the left child, it calls `Init()` and `Next()` on the entire right child, evaluating the join condition. This is heavily CPU and I/O intensive ($O(N \times M)$ complexity).
+
+To optimize, we can implement a Hash Join.
+1. **Build Phase:** Read all tuples from the left child. Hash the join key, and insert the tuple into an in-memory hash table.
+2. **Probe Phase:** Read tuples one by one from the right child. Hash its join key, and do a $O(1)$ lookup in the hash table to find matches. This reduces complexity to $O(N + M)$, but requires enough memory to hold the left table.
+
+### Q31: How do you handle aggregate functions like `COUNT()` or `SUM()`?
+**Answer:**
+Aggregations break the standard streaming pipelining because you cannot output the final count until you have seen every single row.
+The `AggregationExecutor` implements a blocking pipeline breaker.
+In its `Init()` phase, it repeatedly calls `Next()` on its child until EOF, maintaining a running state in memory (e.g., `running_sum += tuple.val`). 
+Only after the child is exhausted does `Init()` finish. When the parent subsequently calls `Next()` on the AggregationExecutor, it immediately emits the single aggregated result tuple and then returns EOF on the second call.
+
+### Q32: What happens during an `INSERT` execution?
+**Answer:**
+The `InsertExecutor` acts as a sink. It has a child node (which could be a `ValuesExecutor` parsing literal values, or a `SeqScan` for `INSERT INTO ... SELECT`).
+When `Next()` is called, it pulls a tuple from the child, calls the Storage Engine's `InsertTuple(table_id, tuple)` method, and receives an RID.
+Crucially, it must also update indexes. It queries the system catalog for all indexes on this table, extracts the index key from the tuple, and calls `BPlusTree::Insert(key, RID)`. Finally, it returns an integer indicating rows affected.
+
+### Q33: How does the system plan and execute an `UPDATE` statement?
+**Answer:**
+An `UPDATE` requires finding the rows, modifying them, and writing them back.
+The plan is: `SeqScan` (or `IndexScan`) -> `Filter` -> `UpdateExecutor`.
+The `UpdateExecutor` pulls a tuple and its RID. It modifies the fields specified in the SET clause. 
+It then calls `UpdateTuple(RID, new_tuple)` on the Storage Engine. 
+If indexed columns were modified, it must also execute `BPlusTree::Delete(old_key, RID)` and `BPlusTree::Insert(new_key, RID)` to keep the indexes consistent.
+
+### Q34: What data structures do you use to pass `Tuple` objects between execution nodes efficiently?
+**Answer:**
+A `Tuple` object contains a pointer to a dynamically allocated byte array and a `Schema` pointer to interpret the bytes.
+To avoid massive memory copying during execution (copying a 1KB tuple from SeqScan -> Filter -> Limit), the Executors pass Tuples by reference or use `std::shared_ptr<Tuple>`. 
+Even better, for simple selections, we use late materialization: passing just the `RID` upward until the final node actually needs to extract the string values for display.
+
+---
+
+## Part 5: Indexing (B+ Tree Implementation)
+
+### Q35: Why implement a B+Tree instead of a standard Binary Search Tree or Hash Map for indexing?
+**Answer:**
+1. **Disk-Oriented:** A BST node might contain just two pointers and a value (24 bytes). Writing a 24-byte node to disk is terrible for I/O. A B+Tree node is sized to exactly fit one disk page (4KB). This means a single node has hundreds of keys and children. The tree is extremely wide and shallow (high fanout), meaning we can find any record in billions of rows with just 3 or 4 disk reads.
+2. **Range Queries:** Hash maps only support exact matches (`O(1)`). They cannot answer `WHERE age > 20`. A B+Tree keeps keys sorted. The leaf nodes are linked together in a doubly-linked list, allowing for incredibly fast sequential scans for range queries.
+
+### Q36: Explain the structure of an internal node vs. a leaf node in your B+Tree.
+**Answer:**
+Both node types share a common 4KB page header containing `PageType`, `Size`, and `MaxSize`.
+*   **Internal Node:** Stores an array of `K` keys and `K+1` child pointers (PageIDs). The keys act as traffic cops. If a search key is less than Key[i], it follows Pointer[i]. It does *not* store raw data or RIDs.
+*   **Leaf Node:** Stores an array of `K` keys and `K` values. In our architecture, the value is an `RID`. Furthermore, leaf nodes have an extra `NextLeafPageID` pointer in their header to form the linked list.
+
+### Q37: Walk through the algorithm for inserting a new key into the B+Tree.
+**Answer:**
+1. **Search:** Traverse down from the root to find the correct leaf node for the key.
+2. **Insert:** Insert the `(Key, RID)` into the sorted array inside the leaf node.
+3. **Check Capacity:** If the leaf is not full, we are done.
+4. **Split (if full):** Allocate a new leaf page. Move half the keys to the new page. Link the new page into the leaf linked list. Take the *first key* of the new page and insert it (along with the new page's ID) into the parent internal node.
+5. **Propagate:** If the parent is now full, split it recursively. If the root splits, allocate a new root page, increasing the height of the tree.
+
+### Q38: How do you handle deletions and node underflows in the B+Tree?
+**Answer:**
+Deletions are complex. We locate the key in the leaf and remove it.
+If the node's size drops below half capacity (`MaxSize / 2`), it suffers from underflow.
+1. **Borrow (Redistribute):** We look at immediate sibling nodes. If a sibling has abundant keys, we shift one key over to our underflowed node and update the parent's routing key.
+2. **Merge (Coalesce):** If siblings are also at minimum capacity, borrowing is impossible. We merge the node with a sibling, transferring all keys into one node, freeing the other page, and deleting the routing key from the parent (which may cause the parent to underflow, propagating up).
+
+### Q39: How does the B+Tree interact with the Buffer Pool Manager? (Crabbing / Latch Crabbing)
+**Answer:**
+The B+Tree does not live entirely in memory. It asks the Buffer Pool for nodes on demand.
+When searching, we start at the root:
+1. `FetchPage(root_id)` and pin it.
+2. Search keys, find the next child pointer.
+3. `FetchPage(child_id)` and pin it.
+4. `UnpinPage(root_id)`.
+This technique, known as crabbing, ensures we only hold memory for the exact path we are traversing, preventing the tree from exhausting the buffer pool.
+
+### Q40: How do you support non-unique keys in the B+Tree (e.g., an index on a `last_name` column)?
+**Answer:**
+Standard B+Trees assume unique keys. To support non-unique keys, we can take two approaches:
+1.  **Composite Keys:** We internally append the unique `RID` to the user's key. So if inserting "Smith", we actually insert `("Smith", RID_1)`. This forces every key to be unique, maintaining standard B+Tree invariants.
+2.  **RID Lists:** The leaf node stores keys, but the value is a pointer to an overflow page containing a list of RIDs.
+We opted for the first approach (Composite Keys) as it avoids the complexity of managing variable-length RID lists inside fixed-size node arrays.
+
+### Q41: Explain how an `IndexScanExecutor` differs from a `SeqScanExecutor` during query execution.
+**Answer:**
+If the query planner detects a `WHERE id = 50` condition and an index exists on `id`, it uses an `IndexScanExecutor`.
+Instead of reading every heap page, the executor queries the B+Tree directly: `tree.GetValue(50)`.
+The B+Tree traverses its nodes (3-4 page reads), finds the `RID`, and returns it.
+The executor then fetches the specific heap page via that `RID` to reconstruct the full Tuple. 
+This bypasses scanning thousands of pages, demonstrating the massive I/O savings of indexing.
+
+### Q42: What happens to the indexes when a table is dropped?
+**Answer:**
+When a `DROP TABLE` command is executed, the system catalog identifies all index roots associated with the table.
+We must free the disk space. The system traverses the B+Trees, deleting every node and adding their `PageID`s back to the Free Space Map / Disk Manager, ensuring the 4KB blocks can be reused by future tables. Finally, the heap pages are also freed, and the catalog entries are deleted.
+
+---
+
+## Part 6: Concurrency and Transactions (Concepts)
+
+### Q43: How would you implement ACID guarantees in this architecture? Explain Write-Ahead Logging (WAL).
+**Answer:**
+Currently, the mini-SQL database relies on OS-level atomic writes for single pages. To achieve full Durability and Atomicity across multi-page operations, a WAL is required.
+Before a dirty page is flushed to disk by the Buffer Pool, a log record describing the change (e.g., "Inserted tuple X at RID Y") must be written to a sequential log file and `fsync`'d. 
+If the system crashes midway, recovery involves scanning the WAL. We redo committed transactions to ensure durability, and undo uncommitted transactions (using the old values stored in the log) to restore atomicity.
+
+### Q44: What is the purpose of Two-Phase Locking (2PL), and where would it hook into the engine?
+**Answer:**
+To provide Isolation between concurrent queries, we would implement a Lock Manager.
+Before an Executor reads a tuple, it asks the Lock Manager for a Shared (S) lock on the RID.
+Before it updates/inserts, it asks for an Exclusive (X) lock.
+Two-Phase locking means transactions acquire locks during their execution phase (Growing phase) and only release them all at once when they COMMIT or ABORT (Shrinking phase). This guarantees serializability and prevents phenomena like dirty reads or lost updates.
+
+### Q45: How do latches differ from locks in database terminology?
+**Answer:**
+*   **Locks:** Logical concurrency control. They protect database objects (Tuples, Tables) from conflicting transactions. They are held for the duration of a transaction (long-lived) and support deadlocks (which must be detected/resolved).
+*   **Latches:** Physical concurrency control. They protect in-memory data structures (like a specific B+Tree node or the Buffer Pool LRU list) from race conditions between threads. They are implemented via C++ `std::mutex`, held for microseconds, and must not deadlock.
+
+### Q46: How would you handle dirty reads in a multi-threaded environment?
+**Answer:**
+Without a Lock Manager, if Thread A inserts a row into the buffer pool but hasn't committed, and Thread B does a Sequential Scan, Thread B will see the uncommitted row (a dirty read).
+To fix this without blocking, we could implement Multi-Version Concurrency Control (MVCC). Instead of modifying tuples in place, an update creates a new version of the tuple with a timestamp. Thread B reads the version of the tuple that was committed *before* Thread B started, safely ignoring Thread A's uncommitted changes.
+
+---
+
+## Part 7: Qt6 GUI and IDE Integration
+
+### Q47: Why use Qt6 for the frontend, and how does it interact with the C++ backend engine?
+**Answer:**
+Qt6 was chosen because it allows us to build a cross-platform, native desktop application (like PgAdmin or DBeaver) using the same C++ codebase as the database engine itself. 
+We statically link the database engine library into the Qt application. There are no network sockets or TCP overhead. The GUI creates an instance of `DatabaseInstance db("local.db")`.
+When the user clicks "Execute", the GUI extracts the string from the text editor, passes it to `db.ExecuteQuery()`, receives a `ResultTable` object (containing rows and schema), and populates a `QTableView`.
+
+### Q48: How is the real-time syntax highlighting implemented in the SQL Editor?
+**Answer:**
+We subclass `QSyntaxHighlighter` and apply it to a `QTextEdit`.
+Because we already wrote a custom Lexer for the backend, we reuse it! 
+The `highlightBlock(const QString &text)` function converts the Qt string to standard C++ string, runs our Lexer, and receives a list of Tokens.
+We map `TokenType::KEYWORD` to a blue bold `QTextCharFormat`, `TokenType::STRING_LITERAL` to green, etc., and apply these formats to the text block. This ensures the frontend highlighting precisely matches the backend's parsing rules.
+
+### Q49: How does the Schema Tree (Sidebar) dynamically reflect changes (like `CREATE TABLE`)?
+**Answer:**
+The GUI follows a Model-View architecture. We use a `QTreeView` mapped to a custom `QAbstractItemModel`.
+When a query executes, we check the result status. If it was a DDL statement (`CREATE/DROP`), the engine emits a C++ callback or standard Qt Signal (`schemaChanged()`).
+The GUI catches this signal, queries the system catalog (`SELECT * FROM sqlite_master` equivalent) using the database API, rebuilds the internal tree data structure, and calls `beginResetModel() / endResetModel()`, causing the sidebar to instantly redraw the new tables and columns.
+
+### Q50: How do you ensure the UI remains responsive during a heavy, long-running query?
+**Answer:**
+If we execute a 5-second `HashJoin` on the main GUI thread, the Qt event loop will block, causing the application to freeze ("Not Responding").
+To solve this, we use `QThread` or `QtConcurrent::run`.
+When the user executes a query, we spawn a background worker thread. The worker instantiates the query planner and execution engine. 
+The main UI thread shows a loading spinner. Once the worker finishes and accumulates the result rows, it emits a signal carrying the data back to the main thread via Qt's thread-safe signal/slot mechanism, which then populates the table view safely on the UI thread.

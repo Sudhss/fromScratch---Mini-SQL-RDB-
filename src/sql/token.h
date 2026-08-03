@@ -49,6 +49,7 @@ enum class TokenType {
     INNER,
     LEFT,
     RIGHT,
+    OUTER,
     ON,
     CROSS,
 

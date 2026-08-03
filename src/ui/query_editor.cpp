@@ -1,6 +1,6 @@
 #include "ui/query_editor.h"
 #include "theme/sql_highlighter.h"
-#include "theme/theme.h"
+#include "ui/theme.h"
 #include <QPainter>
 #include <QTextBlock>
 #include <QKeyEvent>

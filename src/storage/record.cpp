@@ -1,6 +1,7 @@
 #include "storage/record.h"
 #include <QtEndian>
 #include <QDataStream>
+#include <QIODevice>
 
 namespace minidb {
 
@@ -13,7 +14,7 @@ QByteArray RecordSerializer::serialize(const Row& row, const TableSchema& schema
     QByteArray nullBitmap(numNullBytes, 0);
     
     for (int i = 0; i < numColumns; ++i) {
-        if (row.size() <= i || row[i].index() == 0) { // Assuming std::monostate is index 0
+        if (row.size() <= i || row[i].isNull()) {
             nullBitmap[i / 8] = nullBitmap[i / 8] | (1 << (i % 8));
         }
     }
@@ -29,23 +30,23 @@ QByteArray RecordSerializer::serialize(const Row& row, const TableSchema& schema
         
         switch (schema.columns[i].type) {
             case DataType::INT:
-                stream << static_cast<qint32>(std::get<int32_t>(val));
+                stream << static_cast<qint32>(val.toInt());
                 break;
             case DataType::FLOAT:
-                stream << std::get<double>(val);
+                stream << val.toFloat();
                 break;
             case DataType::VARCHAR: {
-                QString str = std::get<QString>(val);
+                QString str = val.toVarchar();
                 QByteArray utf8 = str.toUtf8();
                 stream << static_cast<quint16>(utf8.size());
                 stream.writeRawData(utf8.constData(), utf8.size());
                 break;
             }
             case DataType::BOOL:
-                stream << static_cast<qint8>(std::get<bool>(val) ? 1 : 0);
+                stream << static_cast<qint8>(val.toBool() ? 1 : 0);
                 break;
             case DataType::DATE:
-                stream << static_cast<qint32>(std::get<int32_t>(val)); // Julian day or timestamp
+                stream << static_cast<qint32>(val.toInt()); // Date is stored as int
                 break;
         }
     }
@@ -65,7 +66,7 @@ Row RecordSerializer::deserialize(const QByteArray& data, const TableSchema& sch
     
     for (int i = 0; i < numColumns; ++i) {
         if (nullBitmap[i / 8] & (1 << (i % 8))) {
-            row.push_back(std::monostate{});
+            row.push_back(Value());
             continue;
         }
         
@@ -73,13 +74,13 @@ Row RecordSerializer::deserialize(const QByteArray& data, const TableSchema& sch
             case DataType::INT: {
                 qint32 val;
                 stream >> val;
-                row.push_back(static_cast<int32_t>(val));
+                row.push_back(Value(static_cast<int32_t>(val)));
                 break;
             }
             case DataType::FLOAT: {
                 double val;
                 stream >> val;
-                row.push_back(val);
+                row.push_back(Value(val));
                 break;
             }
             case DataType::VARCHAR: {
@@ -87,19 +88,21 @@ Row RecordSerializer::deserialize(const QByteArray& data, const TableSchema& sch
                 stream >> len;
                 QByteArray strData(len, 0);
                 stream.readRawData(strData.data(), len);
-                row.push_back(QString::fromUtf8(strData));
+                row.push_back(Value(QString::fromUtf8(strData)));
                 break;
             }
             case DataType::BOOL: {
                 qint8 val;
                 stream >> val;
-                row.push_back(val != 0);
+                row.push_back(Value(val != 0));
                 break;
             }
             case DataType::DATE: {
                 qint32 val;
                 stream >> val;
-                row.push_back(static_cast<int32_t>(val));
+                // Value has constructor for QDate, but we serialize it as int. We need to construct from QDate if that's what it expects, or we can just construct an int if the schema handles it.
+                // Wait, Value(QDate) exists. How does QDate serialize? 
+                row.push_back(Value(QDate::fromJulianDay(val)));
                 break;
             }
         }

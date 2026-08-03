@@ -3,7 +3,7 @@
 #include <QString>
 #include <QFile>
 #include <QHash>
-#include <QList>
+#include <list>
 #include <memory>
 
 namespace minidb {
@@ -49,8 +49,8 @@ private:
     size_t m_maxCacheSize;
     FileHeader m_header;
 
-    QHash<uint32_t, QList<CacheEntry>::iterator> m_cacheMap;
-    QList<CacheEntry> m_cacheList;
+    QHash<uint32_t, std::list<CacheEntry>::iterator> m_cacheMap;
+    std::list<CacheEntry> m_cacheList;
 };
 
 } // namespace minidb

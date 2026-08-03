@@ -10,30 +10,27 @@ namespace minidb {
 Executor::Executor(Catalog& catalog, Pager& pager) : catalog(catalog), pager(pager) {}
 
 QueryResult Executor::execute(const Statement& stmt) {
-    return std::visit([&](auto&& arg) -> QueryResult {
-        using T = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<T, SelectStmt>) return executeSelect(arg);
-        else if constexpr (std::is_same_v<T, InsertStmt>) return executeInsert(arg);
-        else if constexpr (std::is_same_v<T, UpdateStmt>) return executeUpdate(arg);
-        else if constexpr (std::is_same_v<T, DeleteStmt>) return executeDelete(arg);
-        else if constexpr (std::is_same_v<T, CreateTableStmt>) return executeCreateTable(arg);
-        else if constexpr (std::is_same_v<T, DropTableStmt>) return executeDropTable(arg);
-        else if constexpr (std::is_same_v<T, ShowTablesStmt>) return executeShowTables(arg);
-        else if constexpr (std::is_same_v<T, DescribeStmt>) return executeDescribe(arg);
-        else throw Exception("Unsupported statement type");
-    }, stmt);
+    if (const auto* s = dynamic_cast<const SelectStmt*>(&stmt)) return executeSelect(*s);
+    if (const auto* i = dynamic_cast<const InsertStmt*>(&stmt)) return executeInsert(*i);
+    if (const auto* u = dynamic_cast<const UpdateStmt*>(&stmt)) return executeUpdate(*u);
+    if (const auto* d = dynamic_cast<const DeleteStmt*>(&stmt)) return executeDelete(*d);
+    if (const auto* c = dynamic_cast<const CreateTableStmt*>(&stmt)) return executeCreateTable(*c);
+    if (const auto* dt = dynamic_cast<const DropTableStmt*>(&stmt)) return executeDropTable(*dt);
+    if (const auto* st = dynamic_cast<const ShowTablesStmt*>(&stmt)) return executeShowTables(*st);
+    if (const auto* ds = dynamic_cast<const DescribeStmt*>(&stmt)) return executeDescribe(*ds);
+    throw ExecutionError("Unsupported statement type");
 }
 
 Value Executor::accumulateAggregate(const FunctionCallExpr& func, const QVector<Row>& groupRows, const EvalContext& context) {
     QString fnName = func.functionName.toUpper();
     if (fnName == "COUNT") {
-        if (func.arguments.empty()) {
+        if (func.args.empty()) {
             return Value(static_cast<int>(groupRows.size()));
         }
         int count = 0;
         for (const auto& row : groupRows) {
-            Value val = Evaluator::evaluate(func.arguments[0], row, context);
-            if (!std::holds_alternative<std::monostate>(val)) {
+            Value val = Evaluator::evaluate(*func.args[0], row, context);
+            if (!val.isNull()) {
                 count++;
             }
         }
@@ -42,111 +39,125 @@ Value Executor::accumulateAggregate(const FunctionCallExpr& func, const QVector<
         int sum = 0;
         bool hasNonNull = false;
         for (const auto& row : groupRows) {
-            Value val = Evaluator::evaluate(func.arguments[0], row, context);
-            if (std::holds_alternative<int>(val)) {
-                sum += std::get<int>(val);
+            Value val = Evaluator::evaluate(*func.args[0], row, context);
+            if (val.type() == DataType::INT) {
+                sum += val.toInt();
                 hasNonNull = true;
             }
         }
-        return hasNonNull ? Value(sum) : Value(std::monostate{});
+        return hasNonNull ? Value(sum) : Value();
     } else if (fnName == "AVG") {
         int sum = 0;
         int count = 0;
         for (const auto& row : groupRows) {
-            Value val = Evaluator::evaluate(func.arguments[0], row, context);
-            if (std::holds_alternative<int>(val)) {
-                sum += std::get<int>(val);
+            Value val = Evaluator::evaluate(*func.args[0], row, context);
+            if (val.type() == DataType::INT) {
+                sum += val.toInt();
                 count++;
             }
         }
-        return count > 0 ? Value(sum / count) : Value(std::monostate{});
+        return count > 0 ? Value(sum / count) : Value();
     } else if (fnName == "MIN") {
         std::optional<Value> minVal;
         for (const auto& row : groupRows) {
-            Value val = Evaluator::evaluate(func.arguments[0], row, context);
-            if (!std::holds_alternative<std::monostate>(val)) {
+            Value val = Evaluator::evaluate(*func.args[0], row, context);
+            if (!val.isNull()) {
                 if (!minVal.has_value() || val < minVal.value()) {
                     minVal = val;
                 }
             }
         }
-        return minVal.has_value() ? minVal.value() : Value(std::monostate{});
+        return minVal.has_value() ? minVal.value() : Value();
     } else if (fnName == "MAX") {
         std::optional<Value> maxVal;
         for (const auto& row : groupRows) {
-            Value val = Evaluator::evaluate(func.arguments[0], row, context);
-            if (!std::holds_alternative<std::monostate>(val)) {
+            Value val = Evaluator::evaluate(*func.args[0], row, context);
+            if (!val.isNull()) {
                 if (!maxVal.has_value() || val > maxVal.value()) {
                     maxVal = val;
                 }
             }
         }
-        return maxVal.has_value() ? maxVal.value() : Value(std::monostate{});
+        return maxVal.has_value() ? maxVal.value() : Value();
     }
-    throw Exception("Unsupported aggregate function: " + fnName);
+    throw ExecutionError("Unsupported aggregate function: " + fnName);
 }
 
 QueryResult Executor::executeSelect(const SelectStmt& stmt) {
-    if (stmt.fromTables.empty()) {
-        QueryResult result;
+    if (stmt.tableRefs.empty()) {
+        QStringList resCols;
+        QVector<Row> resRows;
         Row row;
         for (const auto& expr : stmt.columns) {
             TableSchema emptySchema;
-            emptySchema.tableName = "";
-            row.append(Evaluator::evaluate(expr, Row(), emptySchema));
-            result.columns.append("expr");
+            emptySchema.name = "";
+            row.push_back(Evaluator::evaluate(*expr.expression, Row(), emptySchema));
+            resCols.append("expr");
         }
-        result.rows.append(row);
-        return result;
+        resRows.append(row);
+        return QueryResult::selectResult(resCols, resRows);
     }
 
     Planner planner(catalog);
     QueryPlan plan = planner.plan(stmt);
 
     QVector<QPair<QString, TableSchema>> schemas;
-    QVector<Table> tables;
-    QVector<BTree> btrees;
+    std::vector<std::unique_ptr<Table>> tables;
+    std::vector<std::unique_ptr<BTree>> btrees;
 
-    for (const auto& tRef : stmt.fromTables) {
-        if (!catalog.tableExists(tRef.tableName)) {
-            throw Exception("Table does not exist: " + tRef.tableName);
+    for (const auto& tRef : stmt.tableRefs) {
+        if (!catalog.hasTable(tRef.tableName)) {
+            throw ExecutionError("Table does not exist: " + tRef.tableName);
         }
-        TableSchema schema = catalog.getTableSchema(tRef.tableName);
-        QString alias = tRef.alias.has_value() ? tRef.alias.value() : tRef.tableName;
+        TableSchema schema = catalog.getSchema(tRef.tableName);
+        QString alias = tRef.alias.isEmpty() ? tRef.tableName : tRef.alias;
         schemas.append({alias, schema});
         
-        tables.emplace_back(pager, schema.rootPage);
-        btrees.emplace_back(pager, schema.rootPage);
+        tables.push_back(std::make_unique<Table>(pager, schema, catalog.getTablePageId(tRef.tableName)));
+        btrees.push_back(std::make_unique<BTree>(pager, 0, DataType::INT));
     }
 
     EvalContext context(schemas);
     QVector<Row> joinedRows;
 
     // Scan the first table
+    QVector<std::pair<RowId, Row>> firstTableRows;
+    auto iter = tables[0]->scan();
+    while (iter.hasNext()) firstTableRows.append(iter.next());
+    
     if (plan.useIndex && plan.scanType == ScanType::INDEX_LOOKUP) {
-        Value val = btrees[0].find(plan.indexKey);
-        if (!std::holds_alternative<std::monostate>(val)) {
-            joinedRows.append(tables[0].readRow(std::get<int>(val)));
+        RowId rid = btrees[0]->search(plan.indexKey);
+        if (rid.isValid()) {
+            joinedRows.append(tables[0]->getRow(rid));
         }
     } else {
-        auto allRows = tables[0].fullScan();
-        for (const auto& pr : allRows) joinedRows.append(pr.second);
+        for (const auto& pr : firstTableRows) joinedRows.append(pr.second);
     }
 
     // Process JOINs
-    for (int i = 1; i < stmt.fromTables.size(); ++i) {
+    for (int i = 0; i < stmt.joins.size(); ++i) {
+        const auto& join = stmt.joins[i];
+        if (!catalog.hasTable(join.tableName)) throw ExecutionError("Table not found: " + join.tableName);
+        
+        TableSchema schema = catalog.getSchema(join.tableName);
+        QString alias = join.alias.isEmpty() ? join.tableName : join.alias;
+        schemas.append({alias, schema});
+        
+        Table joinTable(pager, schema, catalog.getTablePageId(join.tableName));
+        
         QVector<Row> nextJoinedRows;
-        auto innerRows = tables[i].fullScan();
-        const auto& joinCond = stmt.fromTables[i].joinCondition;
-
+        auto innerRows = joinTable.scan();
+        QVector<std::pair<RowId, Row>> innerRowsList;
+        while (innerRows.hasNext()) innerRowsList.append(innerRows.next());
+        
         for (const auto& outerRow : joinedRows) {
             bool matched = false;
-            for (const auto& innerPr : innerRows) {
+            for (const auto& innerPr : innerRowsList) {
                 Row combined = outerRow;
-                combined.append(innerPr.second);
+                combined.insert(combined.end(), innerPr.second.begin(), innerPr.second.end());
 
-                if (joinCond) {
-                    if (Evaluator::evaluateCondition(*joinCond, combined, context)) {
+                if (join.onCondition) {
+                    if (Evaluator::evaluateCondition(*join.onCondition, combined, context)) {
                         nextJoinedRows.append(combined);
                         matched = true;
                     }
@@ -155,10 +166,10 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
                     matched = true;
                 }
             }
-            if (!matched && stmt.fromTables[i].joinType == JoinType::LEFT) {
+            if (!matched && join.type == JoinType::LEFT) {
                 Row combined = outerRow;
-                for (int c = 0; c < schemas[i].second.columns.size(); ++c) {
-                    combined.append(Value(std::monostate{}));
+                for (int c = 0; c < schema.columns.size(); ++c) {
+                    combined.push_back(Value());
                 }
                 nextJoinedRows.append(combined);
             }
@@ -181,7 +192,7 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
     // Aggregations / GROUP BY
     bool hasAggregates = false;
     for (const auto& expr : stmt.columns) {
-        if (std::holds_alternative<FunctionCallExpr>(expr)) hasAggregates = true;
+        if (dynamic_cast<FunctionCallExpr*>(expr.expression.get())) hasAggregates = true;
     }
 
     QVector<Row> finalRows;
@@ -193,7 +204,7 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
             for (const auto& row : filteredRows) {
                 QVector<Value> groupKey;
                 for (const auto& gExpr : stmt.groupBy) {
-                    groupKey.append(Evaluator::evaluate(gExpr, row, context));
+                    groupKey.append(Evaluator::evaluate(*gExpr, row, context));
                 }
                 groups[groupKey].append(row);
             }
@@ -202,10 +213,10 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
         for (const auto& [key, group] : groups) {
             Row outRow;
             for (const auto& expr : stmt.columns) {
-                if (std::holds_alternative<FunctionCallExpr>(expr)) {
-                    outRow.append(accumulateAggregate(std::get<FunctionCallExpr>(expr), group, context));
+                if (auto* func = dynamic_cast<FunctionCallExpr*>(expr.expression.get())) {
+                    outRow.push_back(accumulateAggregate(*func, group, context));
                 } else {
-                    outRow.append(Evaluator::evaluate(expr, group.empty() ? Row() : group[0], context));
+                    outRow.push_back(Evaluator::evaluate(*expr.expression, group.empty() ? Row() : group[0], context));
                 }
             }
             finalRows.append(outRow);
@@ -214,7 +225,7 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
         for (const auto& row : filteredRows) {
             Row outRow;
             for (const auto& expr : stmt.columns) {
-                outRow.append(Evaluator::evaluate(expr, row, context));
+                outRow.push_back(Evaluator::evaluate(*expr.expression, row, context));
             }
             finalRows.append(outRow);
         }
@@ -233,19 +244,19 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
     if (!stmt.orderBy.empty()) {
         std::sort(finalRows.begin(), finalRows.end(), [&](const Row& a, const Row& b) {
             for (const auto& order : stmt.orderBy) {
-                Value va = Evaluator::evaluate(order.expr, a, context);
-                Value vb = Evaluator::evaluate(order.expr, b, context);
+                Value va = Evaluator::evaluate(*order.expression, a, context);
+                Value vb = Evaluator::evaluate(*order.expression, b, context);
                 if (va == vb) continue;
-                if (order.direction == OrderDirection::ASC) return va < vb;
+                if (order.isAscending) return va < vb;
                 else return va > vb;
             }
             return false;
         });
     }
 
-    if (stmt.limit.has_value()) {
-        int limit = stmt.limit.value();
-        int offset = stmt.offset.value_or(0);
+    if (stmt.limit > 0) {
+        int limit = stmt.limit;
+        int offset = 0;
         QVector<Row> limited;
         for (int i = offset; i < finalRows.size() && limited.size() < limit; ++i) {
             limited.append(finalRows[i]);
@@ -253,196 +264,153 @@ QueryResult Executor::executeSelect(const SelectStmt& stmt) {
         finalRows = limited;
     }
 
-    QueryResult result;
+    QStringList resColumns;
     for (const auto& expr : stmt.columns) {
-        if (std::holds_alternative<ColumnRefExpr>(expr)) {
-            result.columns.append(std::get<ColumnRefExpr>(expr).columnName);
+        if (const auto* colRef = dynamic_cast<const ColumnRefExpr*>(expr.expression.get())) {
+            resColumns.append(colRef->columnName);
         } else {
-            result.columns.append("expr");
+            resColumns.append("expr");
         }
     }
-    result.rows = finalRows;
-    return result;
+    
+    return QueryResult::selectResult(resColumns, finalRows);
 }
 
 QueryResult Executor::executeInsert(const InsertStmt& stmt) {
-    if (!catalog.tableExists(stmt.tableName)) {
-        throw Exception("Table does not exist: " + stmt.tableName);
+    if (!catalog.hasTable(stmt.tableName)) {
+        throw ExecutionError("Table does not exist: " + stmt.tableName);
     }
-    TableSchema schema = catalog.getTableSchema(stmt.tableName);
-    Table table(pager, schema.rootPage);
-    BTree btree(pager, schema.rootPage);
+    TableSchema schema = catalog.getSchema(stmt.tableName);
+    Table table(pager, schema, catalog.getTablePageId(stmt.tableName));
 
     int count = 0;
     for (const auto& rowVals : stmt.values) {
-        Row newRow;
-        for (const auto& expr : rowVals) {
-            newRow.append(Evaluator::evaluate(expr, Row(), schema));
-        }
-        
-        int rowId = table.insertRow(newRow);
-        
-        if (schema.hasPrimaryKey) {
-            int pkIndex = -1;
-            for (int i = 0; i < schema.columns.size(); ++i) {
-                if (schema.columns[i].name == schema.primaryKey) {
-                    pkIndex = i;
-                    break;
-                }
-            }
-            if (pkIndex != -1) {
-                btree.insert(newRow[pkIndex], rowId);
-            }
-        }
+        RowId rowId = table.insertRow(rowVals);
         count++;
     }
 
-    return QueryResult::createResult(count);
+    return QueryResult::modificationResult(count);
 }
 
 QueryResult Executor::executeUpdate(const UpdateStmt& stmt) {
-    if (!catalog.tableExists(stmt.tableName)) {
-        throw Exception("Table does not exist: " + stmt.tableName);
+    if (!catalog.hasTable(stmt.tableName)) {
+        throw ExecutionError("Table does not exist: " + stmt.tableName);
     }
-    TableSchema schema = catalog.getTableSchema(stmt.tableName);
-    Table table(pager, schema.rootPage);
-    BTree btree(pager, schema.rootPage);
+    TableSchema schema = catalog.getSchema(stmt.tableName);
+    Table table(pager, schema, catalog.getTablePageId(stmt.tableName));
     Planner planner(catalog);
     QueryPlan plan = planner.plan(stmt);
 
-    auto allRows = table.fullScan();
+    auto iter = table.scan();
     int count = 0;
     
     EvalContext context(schema);
 
-    for (const auto& pr : allRows) {
-        int rowId = pr.first;
+    while (iter.hasNext()) {
+        auto pr = iter.next();
+        RowId rowId = pr.first;
         Row row = pr.second;
         
         if (!stmt.whereClause || Evaluator::evaluateCondition(*stmt.whereClause, row, context)) {
             Row updated = row;
-            for (const auto& assign : stmt.assignments) {
-                int colIdx = context.resolveColumn(std::nullopt, assign.first);
-                updated[colIdx] = Evaluator::evaluate(assign.second, row, context);
+            for (const auto& assign : stmt.setClauses) {
+                int colIdx = context.resolveColumn(std::nullopt, assign.columnName);
+                updated[colIdx] = Evaluator::evaluate(*assign.expression, row, context);
             }
             
             table.updateRow(rowId, updated);
-            
-            if (schema.hasPrimaryKey) {
-                int pkIndex = context.resolveColumn(std::nullopt, schema.primaryKey);
-                if (row[pkIndex] != updated[pkIndex]) {
-                    // btree.remove(row[pkIndex]);
-                    btree.insert(updated[pkIndex], rowId);
-                }
-            }
             count++;
         }
     }
     
-    return QueryResult::createResult(count);
+    return QueryResult::modificationResult(count);
 }
 
 QueryResult Executor::executeDelete(const DeleteStmt& stmt) {
-    if (!catalog.tableExists(stmt.tableName)) {
-        throw Exception("Table does not exist: " + stmt.tableName);
+    if (!catalog.hasTable(stmt.tableName)) {
+        throw ExecutionError("Table does not exist: " + stmt.tableName);
     }
-    TableSchema schema = catalog.getTableSchema(stmt.tableName);
-    Table table(pager, schema.rootPage);
-    BTree btree(pager, schema.rootPage);
+    TableSchema schema = catalog.getSchema(stmt.tableName);
+    Table table(pager, schema, catalog.getTablePageId(stmt.tableName));
     Planner planner(catalog);
     QueryPlan plan = planner.plan(stmt);
 
-    auto allRows = table.fullScan();
+    auto iter = table.scan();
     int count = 0;
     
     EvalContext context(schema);
 
-    for (const auto& pr : allRows) {
-        int rowId = pr.first;
+    while (iter.hasNext()) {
+        auto pr = iter.next();
+        RowId rowId = pr.first;
         Row row = pr.second;
         
         if (!stmt.whereClause || Evaluator::evaluateCondition(*stmt.whereClause, row, context)) {
             table.deleteRow(rowId);
-            if (schema.hasPrimaryKey) {
-                int pkIndex = context.resolveColumn(std::nullopt, schema.primaryKey);
-                // btree.remove(row[pkIndex]);
-            }
             count++;
         }
     }
 
-    return QueryResult::createResult(count);
+    return QueryResult::modificationResult(count);
 }
 
 QueryResult Executor::executeCreateTable(const CreateTableStmt& stmt) {
-    if (catalog.tableExists(stmt.tableName)) {
-        throw Exception("Table already exists: " + stmt.tableName);
+    if (catalog.hasTable(stmt.tableName)) {
+        throw ExecutionError("Table already exists: " + stmt.tableName);
     }
     
     TableSchema schema;
-    schema.tableName = stmt.tableName;
+    schema.name = stmt.tableName;
     for (const auto& cd : stmt.columns) {
-        ColumnSchema cs;
-        cs.name = cd.name;
-        if (cd.type == DataType::INT) cs.type = ColumnType::INTEGER;
-        else if (cd.type == DataType::VARCHAR) cs.type = ColumnType::VARCHAR;
-        else if (cd.type == DataType::BOOLEAN) cs.type = ColumnType::BOOLEAN;
-        schema.columns.append(cs);
-        if (cd.isPrimaryKey) {
-            schema.hasPrimaryKey = true;
-            schema.primaryKey = cd.name;
-        }
+        schema.columns.push_back(cd);
     }
     
-    int rootPage = pager.allocatePage();
-    schema.rootPage = rootPage;
-    
     catalog.createTable(schema);
-    
-    return QueryResult::createResult(0);
+    return QueryResult::ddlResult("Table created");
 }
 
 QueryResult Executor::executeDropTable(const DropTableStmt& stmt) {
-    if (!catalog.tableExists(stmt.tableName)) {
-        throw Exception("Table does not exist: " + stmt.tableName);
+    if (!catalog.hasTable(stmt.tableName)) {
+        throw ExecutionError("Table does not exist: " + stmt.tableName);
     }
     catalog.dropTable(stmt.tableName);
-    return QueryResult::createResult(0);
+    return QueryResult::ddlResult("Table dropped");
 }
 
 QueryResult Executor::executeShowTables(const ShowTablesStmt& /*stmt*/) {
-    QueryResult result;
-    result.columns.append("Tables");
-    for (const auto& tName : catalog.getAllTableNames()) {
+    QStringList cols;
+    cols.append("Tables");
+    QVector<Row> rows;
+    for (const auto& tName : catalog.listTables()) {
         Row r;
-        r.append(Value(tName));
-        result.rows.append(r);
+        r.push_back(Value(tName));
+        rows.append(r);
     }
-    return result;
+    return QueryResult::infoResult(cols, rows);
 }
 
 QueryResult Executor::executeDescribe(const DescribeStmt& stmt) {
-    if (!catalog.tableExists(stmt.tableName)) {
-        throw Exception("Table does not exist: " + stmt.tableName);
+    if (!catalog.hasTable(stmt.tableName)) {
+        throw ExecutionError("Table does not exist: " + stmt.tableName);
     }
-    TableSchema schema = catalog.getTableSchema(stmt.tableName);
+    TableSchema schema = catalog.getSchema(stmt.tableName);
     
-    QueryResult result;
-    result.columns.append("Field");
-    result.columns.append("Type");
-    result.columns.append("Key");
+    QStringList cols;
+    cols.append("Field");
+    cols.append("Type");
+    cols.append("Key");
     
+    QVector<Row> rows;
     for (const auto& col : schema.columns) {
         Row r;
-        r.append(Value(col.name));
-        QString typeStr = (col.type == ColumnType::INTEGER) ? "INTEGER" : 
-                          (col.type == ColumnType::VARCHAR) ? "VARCHAR" : "BOOLEAN";
-        r.append(Value(typeStr));
-        r.append(Value(schema.hasPrimaryKey && schema.primaryKey == col.name ? "PRI" : ""));
-        result.rows.append(r);
+        r.push_back(Value(col.name));
+        QString typeStr = dataTypeToString(col.type);
+        r.push_back(Value(typeStr));
+        r.push_back(Value(col.isPrimaryKey() ? "PRI" : ""));
+        rows.append(r);
     }
     
-    return result;
+    return QueryResult::infoResult(cols, rows);
 }
 
 } // namespace minidb

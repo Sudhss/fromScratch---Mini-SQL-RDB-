@@ -113,7 +113,7 @@ int runCli(const QString& dbPath) {
         } else if (result.type() == minidb::QueryResult::Type::SELECT
                 || result.type() == minidb::QueryResult::Type::INFO) {
             // Print column headers
-            const auto& cols = result.columnNames();
+            const auto& cols = result.columns();
             for (int i = 0; i < cols.size(); ++i) {
                 if (i > 0) out << " | ";
                 out << cols[i].leftJustified(15);
@@ -179,7 +179,6 @@ int main(int argc, char* argv[]) {
     if (cmdParser.isSet(cliOption)) {
         return runCli(dbPath);
     }
-
     // ── GUI mode ──────────────────────────────────────────────────────
     app.setStyleSheet(minidb::theme::darkStyleSheet());
 

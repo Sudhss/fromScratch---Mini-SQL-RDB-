@@ -1,5 +1,5 @@
 #include "ui/results_table.h"
-#include "theme/theme.h"
+#include "ui/theme.h"
 #include <QVBoxLayout>
 #include <QHeaderView>
 #include <QSortFilterProxyModel>
@@ -11,38 +11,32 @@ ResultsTableModel::ResultsTableModel(QObject *parent)
 
 int ResultsTableModel::rowCount(const QModelIndex &parent) const {
     if (parent.isValid()) return 0;
-    return static_cast<int>(currentResult.rows.size());
+    return currentResult.rowCount();
 }
 
 int ResultsTableModel::columnCount(const QModelIndex &parent) const {
     if (parent.isValid()) return 0;
-    return static_cast<int>(currentResult.columns.size());
+    return currentResult.columnCount();
 }
 
 QVariant ResultsTableModel::data(const QModelIndex &index, int role) const {
-    if (!index.isValid() || index.row() >= currentResult.rows.size() || index.column() >= currentResult.columns.size())
+    if (!index.isValid() || index.row() >= currentResult.rowCount() || index.column() >= currentResult.columnCount())
         return QVariant();
 
-    const auto &value = currentResult.rows[index.row()][index.column()];
+    Value value = currentResult.rows()[index.row()][index.column()];
 
     if (role == Qt::DisplayRole || role == Qt::EditRole) {
-        if (std::holds_alternative<std::monostate>(value)) {
+        if (value.isNull()) {
             return "NULL";
-        } else if (std::holds_alternative<int>(value)) {
-            return std::get<int>(value);
-        } else if (std::holds_alternative<double>(value)) {
-            return std::get<double>(value);
-        } else if (std::holds_alternative<bool>(value)) {
-            return std::get<bool>(value) ? "TRUE" : "FALSE";
-        } else if (std::holds_alternative<QString>(value)) {
-            return std::get<QString>(value);
+        } else {
+            return value.toString();
         }
     } else if (role == Qt::ForegroundRole) {
-        if (std::holds_alternative<std::monostate>(value)) {
+        if (value.isNull()) {
             return QColor(Theme::FG_MUTED);
         }
     } else if (role == Qt::FontRole) {
-        if (std::holds_alternative<std::monostate>(value)) {
+        if (value.isNull()) {
             QFont font;
             font.setItalic(true);
             return font;
@@ -55,8 +49,8 @@ QVariant ResultsTableModel::headerData(int section, Qt::Orientation orientation,
     if (role != Qt::DisplayRole)
         return QVariant();
 
-    if (orientation == Qt::Horizontal && section < currentResult.columns.size()) {
-        return currentResult.columns[section];
+    if (orientation == Qt::Horizontal && section < currentResult.columnCount()) {
+        return currentResult.columns()[section];
     } else if (orientation == Qt::Vertical) {
         return section + 1;
     }
@@ -118,22 +112,22 @@ ResultsTable::ResultsTable(QWidget *parent) : QWidget(parent) {
 }
 
 void ResultsTable::setResult(const QueryResult &result) {
-    if (result.type == QueryResult::Type::ERROR) {
+    if (result.hasError()) {
         tableView->hide();
-        statusLabel->setText(result.errorMessage);
+        statusLabel->setText(result.errorMessage());
         statusLabel->setStyleSheet(QString("color: %1; font-weight: bold;").arg(Theme::SYN_KEYWORD));
         statusLabel->show();
-    } else if (result.type == QueryResult::Type::SELECT) {
+    } else if (result.type() == QueryResult::Type::SELECT || result.type() == QueryResult::Type::INFO) {
         statusLabel->hide();
         model->setResult(result);
         tableView->resizeColumnsToContents();
         tableView->show();
     } else {
         tableView->hide();
-        if (result.type == QueryResult::Type::MODIFICATION) {
-            statusLabel->setText(QString("%1 rows affected.").arg(result.affectedRows));
+        if (result.type() == QueryResult::Type::MODIFICATION) {
+            statusLabel->setText(QString("%1 rows affected.").arg(result.affectedRows()));
         } else {
-            statusLabel->setText("Query executed successfully.");
+            statusLabel->setText(result.message().isEmpty() ? "Query executed successfully." : result.message());
         }
         statusLabel->setStyleSheet(QString("color: %1;").arg(Theme::FG_PRIMARY));
         statusLabel->show();

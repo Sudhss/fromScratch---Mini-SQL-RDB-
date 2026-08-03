@@ -1,8 +1,9 @@
 #include "ui/main_window.h"
-#include "theme/theme.h"
+#include "ui/theme.h"
 #include <QMenuBar>
 #include <QToolBar>
 #include <QFileDialog>
+#include <QVBoxLayout>
 #include <QMessageBox>
 #include <QApplication>
 #include <QElapsedTimer>
@@ -106,8 +107,12 @@ void MainWindow::setupMenus() {
     toolbar->addSeparator();
     
     QAction *runAction = toolbar->addAction("▶ Execute");
-    runAction->setToolTip("Execute Query (Ctrl+Enter)");
+    runAction->setToolTip("Execute Single Query (Ctrl+Enter)");
     connect(runAction, &QAction::triggered, [this]() { executeQuery(); });
+    
+    QAction *runAllAction = toolbar->addAction("▶▶ Execute Script");
+    runAllAction->setToolTip("Execute all statements in editor sequentially");
+    connect(runAllAction, &QAction::triggered, this, &MainWindow::executeScript);
     
     toolbar->addAction("Clear", this, &MainWindow::clearEditor);
 }
@@ -133,13 +138,18 @@ void MainWindow::openDatabaseFile(const QString &path) {
     }
     
     try {
-        db = new Database(path);
+        db = new Database();
+        if (!db->open(path)) {
+            throw std::runtime_error("Failed to open database file.");
+        }
         statusBar->setDatabasePath(path);
         updateSchema();
         statusBar->setQueryStatus("Database opened successfully.");
     } catch (const std::exception &e) {
         QMessageBox::critical(this, "Error", QString("Failed to open database: %1").arg(e.what()));
         statusBar->setDatabasePath("");
+        delete db;
+        db = nullptr;
     }
 }
 
@@ -167,20 +177,77 @@ void MainWindow::executeQuery(const QString &sql) {
         
         statusBar->setQueryStatus(QString("Query executed in %1 ms").arg(elapsed));
         
-        if (result.type == QueryResult::Type::SELECT) {
-            statusBar->setRowCount(static_cast<int>(result.rows.size()));
+        if (result.type() == QueryResult::Type::SELECT) {
+            statusBar->setRowCount(result.rowCount());
         } else {
             statusBar->setRowCount(-1);
-            if (result.type == QueryResult::Type::DDL) {
+            if (result.type() == QueryResult::Type::DDL) {
                 updateSchema(); // Refresh schema tree on DDL statements
             }
         }
     } catch (const std::exception &e) {
-        QueryResult errResult;
-        errResult.type = QueryResult::Type::ERROR;
-        errResult.errorMessage = e.what();
+        QueryResult errResult = QueryResult::error(e.what());
         resultsTable->setResult(errResult);
         statusBar->setQueryStatus("Error executing query.");
+        statusBar->setRowCount(-1);
+    }
+}
+
+void MainWindow::executeScript() {
+    if (!db) {
+        QMessageBox::warning(this, "No Database", "Please open or create a database first.");
+        return;
+    }
+
+    QString query = editor->toPlainText();
+    if (query.trimmed().isEmpty()) return;
+
+    QStringList statements = query.split(';', Qt::SkipEmptyParts);
+    
+    int successCount = 0;
+    int errorCount = 0;
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    
+    QueryResult lastResult;
+    bool hasResult = false;
+
+    for (QString stmtStr : statements) {
+        stmtStr = stmtStr.trimmed();
+        if (stmtStr.isEmpty()) continue;
+        
+        try {
+            // Re-append the semicolon that was stripped by split
+            QueryResult result = db->execute(stmtStr + ";");
+            if (result.hasError()) {
+                errorCount++;
+                QMessageBox::critical(this, "Error in Script", QString("Error executing:\n%1\n\n%2").arg(stmtStr).arg(result.errorMessage()));
+                break; // Stop execution on error
+            } else {
+                successCount++;
+                lastResult = result;
+                hasResult = true;
+                if (result.type() == QueryResult::Type::DDL) {
+                    updateSchema();
+                }
+            }
+        } catch (const std::exception &e) {
+            errorCount++;
+            QMessageBox::critical(this, "Error in Script", QString("Exception executing:\n%1\n\n%2").arg(stmtStr).arg(e.what()));
+            break;
+        }
+    }
+    
+    qint64 elapsed = totalTimer.elapsed();
+    
+    if (hasResult && errorCount == 0) {
+        resultsTable->setResult(lastResult);
+    }
+    
+    statusBar->setQueryStatus(QString("Script executed: %1 successful, %2 failed in %3 ms").arg(successCount).arg(errorCount).arg(elapsed));
+    if (lastResult.type() == QueryResult::Type::SELECT) {
+        statusBar->setRowCount(lastResult.rowCount());
+    } else {
         statusBar->setRowCount(-1);
     }
 }
@@ -196,7 +263,7 @@ void MainWindow::clearResults() {
 
 void MainWindow::updateSchema() {
     if (db) {
-        schemaExplorer->refresh(db->getCatalog());
+        schemaExplorer->refresh(db->catalog());
     } else {
         schemaExplorer->refresh(nullptr);
     }

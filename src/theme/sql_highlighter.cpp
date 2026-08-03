@@ -1,5 +1,5 @@
 #include "theme/sql_highlighter.h"
-#include "theme/theme.h"
+#include "ui/theme.h"
 
 namespace minidb {
 

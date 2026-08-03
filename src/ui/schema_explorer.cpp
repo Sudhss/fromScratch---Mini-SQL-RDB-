@@ -1,5 +1,5 @@
 #include "ui/schema_explorer.h"
-#include "theme/theme.h"
+#include "ui/theme.h"
 #include <QVBoxLayout>
 #include <QMenu>
 #include <QHeaderView>
@@ -44,19 +44,19 @@ void SchemaExplorer::refresh(Catalog *catalog) {
     rootItem->setText(0, "📁 Database");
     rootItem->setFont(0, QFont("Segoe UI", 10, QFont::Bold));
     
-    const auto &tables = catalog->getTables();
+    const auto &tables = catalog->listTables();
     for (const auto &tableName : tables) {
         QTreeWidgetItem *tableItem = new QTreeWidgetItem(rootItem);
         tableItem->setText(0, QString("🗃️ %1").arg(tableName));
         tableItem->setData(0, Qt::UserRole, tableName); // Store actual table name
         
-        const auto &columns = catalog->getTableColumns(tableName);
+        const auto &columns = catalog->getSchema(tableName).columns;
         for (const auto &col : columns) {
             QTreeWidgetItem *colItem = new QTreeWidgetItem(tableItem);
             
-            QString colText = QString("📋 %1 (%2)").arg(col.name).arg(col.typeString());
-            if (col.isPrimaryKey) colText += " [PK]";
-            if (col.isNotNull) colText += " [NOT NULL]";
+            QString colText = QString("📋 %1 (%2)").arg(col.name).arg(dataTypeToString(col.type));
+            if (col.isPrimaryKey()) colText += " [PK]";
+            if (col.isNotNull()) colText += " [NOT NULL]";
             
             colItem->setText(0, colText);
             colItem->setForeground(0, QColor(Theme::FG_MUTED));

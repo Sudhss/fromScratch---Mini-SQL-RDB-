@@ -62,7 +62,7 @@ Page Pager::readPage(uint32_t pageId) {
         evictOne();
     }
     
-    m_cacheList.prepend({p, false, pageId});
+    m_cacheList.push_front({p, false, pageId});
     m_cacheMap[pageId] = m_cacheList.begin();
     
     return p;
@@ -78,7 +78,7 @@ void Pager::writePage(uint32_t pageId, const Page& page) {
         if (m_cacheMap.size() >= m_maxCacheSize) {
             evictOne();
         }
-        m_cacheList.prepend({page, true, pageId});
+        m_cacheList.push_front({page, true, pageId});
         m_cacheMap[pageId] = m_cacheList.begin();
     }
 }
@@ -88,14 +88,14 @@ uint32_t Pager::allocatePage() {
     m_file.resize(m_header.pageCount * PAGE_SIZE);
     updateHeader(m_header);
     
-    Page p = Page::createEmpty(PageType::FREE);
+    Page p = Page::createEmpty(PageType::PG_FREE);
     writePage(newPageId, p);
     
     return newPageId;
 }
 
 void Pager::evictOne() {
-    if (m_cacheList.isEmpty()) return;
+    if (m_cacheList.empty()) return;
     auto last = std::prev(m_cacheList.end());
     if (last->dirty) {
         flush(last->pageId);

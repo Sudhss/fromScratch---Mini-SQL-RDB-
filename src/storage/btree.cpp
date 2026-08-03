@@ -8,7 +8,7 @@ BTree::BTree(Pager& pager, uint32_t rootPageId, DataType keyType)
     if (m_rootPageId == 0) {
         // Create root
         m_rootPageId = m_pager.allocatePage();
-        Page p = Page::createEmpty(PageType::INDEX_LEAF);
+        Page p = Page::createEmpty(PageType::PG_INDEX_LEAF);
         m_pager.writePage(m_rootPageId, p);
     }
 }

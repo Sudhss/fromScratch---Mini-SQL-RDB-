@@ -9,12 +9,12 @@ constexpr uint32_t PAGE_HEADER_SIZE = 16;
 constexpr uint32_t SLOT_SIZE = 4;  // 2 bytes offset + 2 bytes length
 
 enum class PageType : uint8_t { 
-    FREE = 0, 
-    DATA = 1, 
-    INDEX_INTERNAL = 2, 
-    INDEX_LEAF = 3, 
-    CATALOG = 4, 
-    OVERFLOW = 5 
+    PG_FREE = 0, 
+    PG_DATA = 1, 
+    PG_INDEX_INTERNAL = 2, 
+    PG_INDEX_LEAF = 3, 
+    PG_CATALOG = 4, 
+    PG_OVERFLOW = 5 
 };
 
 class Page {

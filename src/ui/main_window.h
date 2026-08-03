@@ -23,6 +23,7 @@ private slots:
     void newDatabase();
     void openDatabase();
     void executeQuery(const QString &sql = QString());
+    void executeScript();
     void clearEditor();
     void clearResults();
     void about();

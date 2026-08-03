@@ -6,55 +6,51 @@ namespace minidb {
 Planner::Planner(Catalog& catalog) : catalog(catalog) {}
 
 QueryPlan Planner::plan(const Statement& stmt) {
-    return std::visit([&](auto&& arg) -> QueryPlan {
-        using T = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<T, SelectStmt>) return planSelect(arg);
-        else if constexpr (std::is_same_v<T, UpdateStmt>) return planUpdate(arg);
-        else if constexpr (std::is_same_v<T, DeleteStmt>) return planDelete(arg);
-        else return QueryPlan{};
-    }, stmt);
+    if (const auto* s = dynamic_cast<const SelectStmt*>(&stmt)) return planSelect(*s);
+    if (const auto* u = dynamic_cast<const UpdateStmt*>(&stmt)) return planUpdate(*u);
+    if (const auto* d = dynamic_cast<const DeleteStmt*>(&stmt)) return planDelete(*d);
+    return QueryPlan{};
 }
 
 void Planner::analyzeWhereForIndex(const Expression& where, const TableSchema& schema, QueryPlan& plan) {
-    if (!schema.hasPrimaryKey) return;
+    int pkIdx = schema.primaryKeyIndex();
+    if (pkIdx == -1) return;
+    QString pkName = schema.columns[pkIdx].name;
 
-    if (std::holds_alternative<BinaryExpr>(where)) {
-        const auto& binExpr = std::get<BinaryExpr>(where);
-        
+    if (const auto* binExpr = dynamic_cast<const BinaryExpr*>(&where)) {
         bool leftIsPk = false;
         bool rightIsPk = false;
         
-        if (std::holds_alternative<ColumnRefExpr>(*binExpr.left)) {
-            if (std::get<ColumnRefExpr>(*binExpr.left).columnName == schema.primaryKey) leftIsPk = true;
+        if (const auto* colL = dynamic_cast<const ColumnRefExpr*>(binExpr->left.get())) {
+            if (colL->columnName == pkName) leftIsPk = true;
         }
-        if (std::holds_alternative<ColumnRefExpr>(*binExpr.right)) {
-            if (std::get<ColumnRefExpr>(*binExpr.right).columnName == schema.primaryKey) rightIsPk = true;
+        if (const auto* colR = dynamic_cast<const ColumnRefExpr*>(binExpr->right.get())) {
+            if (colR->columnName == pkName) rightIsPk = true;
         }
 
-        if (leftIsPk && std::holds_alternative<LiteralExpr>(*binExpr.right)) {
-            Value val = std::get<LiteralExpr>(*binExpr.right).value;
-            if (binExpr.op == BinaryOperator::EQ) {
+        if (leftIsPk && dynamic_cast<const LiteralExpr*>(binExpr->right.get())) {
+            Value val = dynamic_cast<const LiteralExpr*>(binExpr->right.get())->value;
+            if (binExpr->op == TokenType::EQUALS) {
                 plan.scanType = ScanType::INDEX_LOOKUP;
                 plan.indexKey = val;
                 plan.useIndex = true;
-            } else if (binExpr.op == BinaryOperator::GT || binExpr.op == BinaryOperator::GTE) {
+            } else if (binExpr->op == TokenType::GREATER_THAN || binExpr->op == TokenType::GREATER_THAN_EQUALS) {
                 plan.scanType = ScanType::INDEX_RANGE_SCAN;
                 plan.indexLow = val;
                 plan.useIndex = true;
-            } else if (binExpr.op == BinaryOperator::LT || binExpr.op == BinaryOperator::LTE) {
+            } else if (binExpr->op == TokenType::LESS_THAN || binExpr->op == TokenType::LESS_THAN_EQUALS) {
                 plan.scanType = ScanType::INDEX_RANGE_SCAN;
                 plan.indexHigh = val;
                 plan.useIndex = true;
             }
         }
-    } else if (std::holds_alternative<BetweenExpr>(where)) {
-        const auto& bwExpr = std::get<BetweenExpr>(where);
-        if (std::holds_alternative<ColumnRefExpr>(*bwExpr.operand)) {
-            if (std::get<ColumnRefExpr>(*bwExpr.operand).columnName == schema.primaryKey) {
-                if (std::holds_alternative<LiteralExpr>(*bwExpr.lower) && std::holds_alternative<LiteralExpr>(*bwExpr.upper)) {
+    } else if (const auto* bwExpr = dynamic_cast<const BetweenExpr*>(&where)) {
+        if (const auto* colExpr = dynamic_cast<const ColumnRefExpr*>(bwExpr->expr.get())) {
+            if (colExpr->columnName == pkName) {
+                if (dynamic_cast<const LiteralExpr*>(bwExpr->low.get()) && dynamic_cast<const LiteralExpr*>(bwExpr->high.get())) {
                     plan.scanType = ScanType::INDEX_RANGE_SCAN;
-                    plan.indexLow = std::get<LiteralExpr>(*bwExpr.lower).value;
-                    plan.indexHigh = std::get<LiteralExpr>(*bwExpr.upper).value;
+                    plan.indexLow = dynamic_cast<const LiteralExpr*>(bwExpr->low.get())->value;
+                    plan.indexHigh = dynamic_cast<const LiteralExpr*>(bwExpr->high.get())->value;
                     plan.useIndex = true;
                 }
             }
@@ -64,18 +60,18 @@ void Planner::analyzeWhereForIndex(const Expression& where, const TableSchema& s
 
 QueryPlan Planner::planSelect(const SelectStmt& stmt) {
     QueryPlan plan;
-    if (stmt.fromTables.empty()) return plan;
+    if (stmt.tableRefs.empty()) return plan;
     
     // Simplistic JOIN order
-    for (const auto& table : stmt.fromTables) {
+    for (const auto& table : stmt.tableRefs) {
         plan.joinOrder.append(table.tableName);
     }
     
     // Analyze primary table for index usage if there's a WHERE clause
     if (stmt.whereClause) {
-        const auto& mainTable = stmt.fromTables[0].tableName;
-        if (catalog.tableExists(mainTable)) {
-            TableSchema schema = catalog.getTableSchema(mainTable);
+        const auto& mainTable = stmt.tableRefs[0].tableName;
+        if (catalog.hasTable(mainTable)) {
+            TableSchema schema = catalog.getSchema(mainTable);
             analyzeWhereForIndex(*stmt.whereClause, schema, plan);
         }
     }
@@ -85,16 +81,16 @@ QueryPlan Planner::planSelect(const SelectStmt& stmt) {
 
 QueryPlan Planner::planUpdate(const UpdateStmt& stmt) {
     QueryPlan plan;
-    if (catalog.tableExists(stmt.tableName) && stmt.whereClause) {
-        analyzeWhereForIndex(*stmt.whereClause, catalog.getTableSchema(stmt.tableName), plan);
+    if (catalog.hasTable(stmt.tableName) && stmt.whereClause) {
+        analyzeWhereForIndex(*stmt.whereClause, catalog.getSchema(stmt.tableName), plan);
     }
     return plan;
 }
 
 QueryPlan Planner::planDelete(const DeleteStmt& stmt) {
     QueryPlan plan;
-    if (catalog.tableExists(stmt.tableName) && stmt.whereClause) {
-        analyzeWhereForIndex(*stmt.whereClause, catalog.getTableSchema(stmt.tableName), plan);
+    if (catalog.hasTable(stmt.tableName) && stmt.whereClause) {
+        analyzeWhereForIndex(*stmt.whereClause, catalog.getSchema(stmt.tableName), plan);
     }
     return plan;
 }

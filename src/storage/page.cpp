@@ -157,7 +157,7 @@ uint16_t Page::freeSpace() const {
 
 void Page::clear() {
     m_data.fill('\0');
-    setPageType(PageType::FREE);
+    setPageType(PageType::PG_FREE);
     updateHeader(0, PAGE_HEADER_SIZE, PAGE_SIZE);
     setNextPageId(0);
 }

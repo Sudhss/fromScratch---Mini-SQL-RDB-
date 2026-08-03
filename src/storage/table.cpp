@@ -78,7 +78,7 @@ RowId Table::insertRow(const Row& row) {
     
     // Allocate new page
     uint32_t newPageId = m_pager.allocatePage();
-    Page newPage = Page::createEmpty(PageType::DATA);
+    Page newPage = Page::createEmpty(PageType::PG_DATA);
     int slot = newPage.addRecord(data);
     m_pager.writePage(newPageId, newPage);
     
@@ -95,14 +95,14 @@ RowId Table::insertRow(const Row& row) {
 
 Row Table::getRow(RowId rid) {
     Page p = m_pager.readPage(rid.pageId);
-    QByteArray data = p.getRecord(rid.slotId);
+    QByteArray data = p.getRecord(rid.slotIndex);
     if (data.isEmpty()) return {};
     return RecordSerializer::deserialize(data, m_schema);
 }
 
 bool Table::deleteRow(RowId rid) {
     Page p = m_pager.readPage(rid.pageId);
-    bool ok = p.deleteRecord(rid.slotId);
+    bool ok = p.deleteRecord(rid.slotIndex);
     if (ok) {
         m_pager.writePage(rid.pageId, p);
     }
@@ -112,7 +112,7 @@ bool Table::deleteRow(RowId rid) {
 bool Table::updateRow(RowId rid, const Row& newRow) {
     QByteArray data = RecordSerializer::serialize(newRow, m_schema);
     Page p = m_pager.readPage(rid.pageId);
-    bool ok = p.updateRecord(rid.slotId, data);
+    bool ok = p.updateRecord(rid.slotIndex, data);
     if (ok) {
         m_pager.writePage(rid.pageId, p);
     } else {

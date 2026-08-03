@@ -12,7 +12,7 @@ uint32_t Catalog::createTable(const TableSchema& schema) {
     }
     
     uint32_t firstPageId = m_pager.allocatePage();
-    Page p = Page::createEmpty(PageType::DATA);
+    Page p = Page::createEmpty(PageType::PG_DATA);
     m_pager.writePage(firstPageId, p);
     
     TableInfo info{schema, firstPageId, 0};
@@ -86,14 +86,14 @@ void Catalog::load() {
         schema.name = name;
         
         for (quint32 j = 0; j < numColumns; ++j) {
-            Column col;
+            ColumnDef col;
             stream >> col.name;
             
             qint32 type;
             stream >> type;
             col.type = static_cast<DataType>(type);
             
-            stream >> col.varchar_len;
+            stream >> col.varcharMaxLen;
             schema.columns.push_back(col);
         }
         
@@ -120,7 +120,7 @@ void Catalog::save() {
         for (const auto& col : info.schema.columns) {
             stream << col.name;
             stream << static_cast<qint32>(col.type);
-            stream << col.varchar_len;
+            stream << col.varcharMaxLen;
         }
         
         stream << info.firstPageId;
@@ -136,8 +136,7 @@ void Catalog::save() {
     // Simplistic save: we assume catalog fits in a sequence of pages
     // Real implementation would free old pages and write new ones
     uint32_t currentPageId = header.catalogPageId;
-    Page p = Page::createEmpty(PageType::CATALOG);
-    
+    Page p = Page::createEmpty(PageType::PG_CATALOG);    
     int offset = 0;
     while (offset < data.size()) {
         int chunkSize = std::min<int>(data.size() - offset, PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE);
@@ -150,7 +149,7 @@ void Catalog::save() {
             m_pager.writePage(currentPageId, p);
             
             currentPageId = nextPageId;
-            p = Page::createEmpty(PageType::CATALOG);
+            p = Page::createEmpty(PageType::PG_CATALOG);
         }
     }
     

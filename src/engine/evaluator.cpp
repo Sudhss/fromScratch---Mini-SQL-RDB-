@@ -38,10 +38,10 @@ int EvalContext::resolveColumn(const std::optional<QString>& table, const QStrin
     }
 
     if (matchCount == 0) {
-        throw Exception("Unknown column: " + column);
+        throw ExecutionError("Unknown column: " + column);
     }
     if (matchCount > 1) {
-        throw Exception("Ambiguous column: " + column);
+        throw ExecutionError("Ambiguous column: " + column);
     }
     return matchedIndex;
 }
@@ -58,141 +58,138 @@ Value Evaluator::evaluate(const Expression& expr, const Row& combinedRow, const 
 
 bool Evaluator::evaluateCondition(const Expression& expr, const Row& row, const TableSchema& schema) {
     Value val = evaluate(expr, row, schema);
-    if (std::holds_alternative<std::monostate>(val)) return false;
-    if (std::holds_alternative<int>(val)) return std::get<int>(val) != 0;
+    if (val.isNull()) return false;
+    if (val.type() == DataType::INT) return val.toInt() != 0;
     return false;
 }
 
 bool Evaluator::evaluateCondition(const Expression& expr, const Row& combinedRow, const EvalContext& context) {
     Value val = evaluate(expr, combinedRow, context);
-    if (std::holds_alternative<std::monostate>(val)) return false;
-    if (std::holds_alternative<int>(val)) return std::get<int>(val) != 0;
+    if (val.isNull()) return false;
+    if (val.type() == DataType::INT) return val.toInt() != 0;
     return false;
 }
 
 Value Evaluator::evaluateInternal(const Expression& expr, const Row& row, const EvalContext& context) {
-    return std::visit([&](auto&& arg) -> Value {
-        using T = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<T, LiteralExpr>) {
-            return arg.value;
-        } else if constexpr (std::is_same_v<T, ColumnRefExpr>) {
-            int idx = context.resolveColumn(arg.tableName, arg.columnName);
-            return row[idx];
-        } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            Value left = evaluateInternal(*arg.left, row, context);
-            Value right = evaluateInternal(*arg.right, row, context);
+    if (const auto* arg = dynamic_cast<const LiteralExpr*>(&expr)) {
+        return arg->value;
+    } else if (const auto* arg = dynamic_cast<const ColumnRefExpr*>(&expr)) {
+        int idx = context.resolveColumn(arg->tableName, arg->columnName);
+        return row[idx];
+    } else if (const auto* arg = dynamic_cast<const BinaryExpr*>(&expr)) {
+        Value left = evaluateInternal(*arg->left, row, context);
+        Value right = evaluateInternal(*arg->right, row, context);
 
-            if (std::holds_alternative<std::monostate>(left) || std::holds_alternative<std::monostate>(right)) {
-                if (arg.op == BinaryOperator::AND) {
-                    if ((std::holds_alternative<int>(left) && std::get<int>(left) == 0) ||
-                        (std::holds_alternative<int>(right) && std::get<int>(right) == 0)) {
-                        return Value(0);
-                    }
-                } else if (arg.op == BinaryOperator::OR) {
-                    if ((std::holds_alternative<int>(left) && std::get<int>(left) != 0) ||
-                        (std::holds_alternative<int>(right) && std::get<int>(right) != 0)) {
-                        return Value(1);
-                    }
+        if (left.isNull() || right.isNull()) {
+            if (arg->op == TokenType::AND) {
+                if ((left.type() == DataType::INT && left.toInt() == 0) ||
+                    (right.type() == DataType::INT && right.toInt() == 0)) {
+                    return Value(0);
                 }
-                return Value(std::monostate{});
-            }
-
-            if (arg.op == BinaryOperator::AND) {
-                bool l = std::get<int>(left) != 0;
-                bool r = std::get<int>(right) != 0;
-                return Value(l && r ? 1 : 0);
-            } else if (arg.op == BinaryOperator::OR) {
-                bool l = std::get<int>(left) != 0;
-                bool r = std::get<int>(right) != 0;
-                return Value(l || r ? 1 : 0);
-            } else if (arg.op == BinaryOperator::EQ) {
-                return Value(left == right ? 1 : 0);
-            } else if (arg.op == BinaryOperator::NEQ) {
-                return Value(left != right ? 1 : 0);
-            } else if (arg.op == BinaryOperator::LT) {
-                return Value(left < right ? 1 : 0);
-            } else if (arg.op == BinaryOperator::GT) {
-                return Value(left > right ? 1 : 0);
-            } else if (arg.op == BinaryOperator::LTE) {
-                return Value(left <= right ? 1 : 0);
-            } else if (arg.op == BinaryOperator::GTE) {
-                return Value(left >= right ? 1 : 0);
-            } else if (arg.op == BinaryOperator::ADD) {
-                if (std::holds_alternative<int>(left) && std::holds_alternative<int>(right)) {
-                    return Value(std::get<int>(left) + std::get<int>(right));
-                }
-                throw Exception("Invalid types for +");
-            } else if (arg.op == BinaryOperator::SUB) {
-                if (std::holds_alternative<int>(left) && std::holds_alternative<int>(right)) {
-                    return Value(std::get<int>(left) - std::get<int>(right));
-                }
-                throw Exception("Invalid types for -");
-            } else if (arg.op == BinaryOperator::MUL) {
-                if (std::holds_alternative<int>(left) && std::holds_alternative<int>(right)) {
-                    return Value(std::get<int>(left) * std::get<int>(right));
-                }
-                throw Exception("Invalid types for *");
-            } else if (arg.op == BinaryOperator::DIV) {
-                if (std::holds_alternative<int>(left) && std::holds_alternative<int>(right)) {
-                    int r = std::get<int>(right);
-                    if (r == 0) throw Exception("Division by zero");
-                    return Value(std::get<int>(left) / r);
-                }
-                throw Exception("Invalid types for /");
-            }
-            throw Exception("Unsupported binary operator");
-        } else if constexpr (std::is_same_v<T, UnaryExpr>) {
-            Value val = evaluateInternal(*arg.operand, row, context);
-            if (std::holds_alternative<std::monostate>(val)) return Value(std::monostate{});
-            if (arg.op == UnaryOperator::NOT) {
-                return Value(std::get<int>(val) == 0 ? 1 : 0);
-            } else if (arg.op == UnaryOperator::MINUS) {
-                if (std::holds_alternative<int>(val)) {
-                    return Value(-std::get<int>(val));
-                }
-                throw Exception("Invalid type for MINUS");
-            }
-            throw Exception("Unsupported unary operator");
-        } else if constexpr (std::is_same_v<T, IsNullExpr>) {
-            Value val = evaluateInternal(*arg.operand, row, context);
-            bool isNull = std::holds_alternative<std::monostate>(val);
-            return Value(arg.isNot ? (isNull ? 0 : 1) : (isNull ? 1 : 0));
-        } else if constexpr (std::is_same_v<T, BetweenExpr>) {
-            Value val = evaluateInternal(*arg.operand, row, context);
-            Value low = evaluateInternal(*arg.lower, row, context);
-            Value high = evaluateInternal(*arg.upper, row, context);
-            if (std::holds_alternative<std::monostate>(val) || std::holds_alternative<std::monostate>(low) || std::holds_alternative<std::monostate>(high)) {
-                return Value(std::monostate{});
-            }
-            return Value((val >= low && val <= high) ? 1 : 0);
-        } else if constexpr (std::is_same_v<T, InListExpr>) {
-            Value val = evaluateInternal(*arg.operand, row, context);
-            if (std::holds_alternative<std::monostate>(val)) return Value(std::monostate{});
-            bool found = false;
-            for (const auto& listExpr : arg.list) {
-                Value listVal = evaluateInternal(listExpr, row, context);
-                if (val == listVal) {
-                    found = true;
-                    break;
+            } else if (arg->op == TokenType::OR) {
+                if ((left.type() == DataType::INT && left.toInt() != 0) ||
+                    (right.type() == DataType::INT && right.toInt() != 0)) {
+                    return Value(1);
                 }
             }
-            return Value(found ? 1 : 0);
-        } else if constexpr (std::is_same_v<T, LikeExpr>) {
-            Value val = evaluateInternal(*arg.operand, row, context);
-            Value pat = evaluateInternal(*arg.pattern, row, context);
-            if (std::holds_alternative<std::monostate>(val) || std::holds_alternative<std::monostate>(pat)) {
-                return Value(std::monostate{});
-            }
-            if (std::holds_alternative<QString>(val) && std::holds_alternative<QString>(pat)) {
-                return Value(likeMatch(std::get<QString>(pat), std::get<QString>(val)) ? 1 : 0);
-            }
-            throw Exception("LIKE requires string operands");
-        } else if constexpr (std::is_same_v<T, FunctionCallExpr>) {
-            // Function calls handled specially by executor, should not be evaluated normally here for aggregates
-            throw Exception("Aggregates not evaluable directly here");
+            return Value();
         }
-        return Value(std::monostate{});
-    }, expr);
+
+        if (arg->op == TokenType::AND) {
+            bool l = left.toInt() != 0;
+            bool r = right.toInt() != 0;
+            return Value(l && r ? 1 : 0);
+        } else if (arg->op == TokenType::OR) {
+            bool l = left.toInt() != 0;
+            bool r = right.toInt() != 0;
+            return Value(l || r ? 1 : 0);
+        } else if (arg->op == TokenType::EQUALS) {
+            return Value(left == right ? 1 : 0);
+        } else if (arg->op == TokenType::NOT_EQUALS) {
+            return Value(left != right ? 1 : 0);
+        } else if (arg->op == TokenType::LESS_THAN) {
+            return Value(left < right ? 1 : 0);
+        } else if (arg->op == TokenType::GREATER_THAN) {
+            return Value(left > right ? 1 : 0);
+        } else if (arg->op == TokenType::LESS_THAN_EQUALS) {
+            return Value(left <= right ? 1 : 0);
+        } else if (arg->op == TokenType::GREATER_THAN_EQUALS) {
+            return Value(left >= right ? 1 : 0);
+        } else if (arg->op == TokenType::PLUS) {
+            if (left.type() == DataType::INT && right.type() == DataType::INT) {
+                return Value(left.toInt() + right.toInt());
+            }
+            throw ExecutionError("Invalid types for +");
+        } else if (arg->op == TokenType::MINUS) {
+            if (left.type() == DataType::INT && right.type() == DataType::INT) {
+                return Value(left.toInt() - right.toInt());
+            }
+            throw ExecutionError("Invalid types for -");
+        } else if (arg->op == TokenType::ASTERISK) {
+            if (left.type() == DataType::INT && right.type() == DataType::INT) {
+                return Value(left.toInt() * right.toInt());
+            }
+            throw ExecutionError("Invalid types for *");
+        } else if (arg->op == TokenType::SLASH) {
+            if (left.type() == DataType::INT && right.type() == DataType::INT) {
+                int r = right.toInt();
+                if (r == 0) throw ExecutionError("Division by zero");
+                return Value(left.toInt() / r);
+            }
+            throw ExecutionError("Invalid types for /");
+        }
+        throw ExecutionError("Unsupported binary operator");
+    } else if (const auto* arg = dynamic_cast<const UnaryExpr*>(&expr)) {
+        Value val = evaluateInternal(*arg->operand, row, context);
+        if (val.isNull()) return Value();
+        if (arg->op == TokenType::NOT) {
+            return Value(val.toInt() == 0 ? 1 : 0);
+        } else if (arg->op == TokenType::MINUS) {
+            if (val.type() == DataType::INT) {
+                return Value(-val.toInt());
+            }
+            throw ExecutionError("Invalid type for MINUS");
+        }
+        throw ExecutionError("Unsupported unary operator");
+    } else if (const auto* arg = dynamic_cast<const IsNullExpr*>(&expr)) {
+        Value val = evaluateInternal(*arg->expr, row, context);
+        bool isNull = val.isNull();
+        return Value(arg->isNot ? (isNull ? 0 : 1) : (isNull ? 1 : 0));
+    } else if (const auto* arg = dynamic_cast<const BetweenExpr*>(&expr)) {
+        Value val = evaluateInternal(*arg->expr, row, context);
+        Value low = evaluateInternal(*arg->low, row, context);
+        Value high = evaluateInternal(*arg->high, row, context);
+        if (val.isNull() || low.isNull() || high.isNull()) {
+            return Value();
+        }
+        return Value((val >= low && val <= high) ? 1 : 0);
+    } else if (const auto* arg = dynamic_cast<const InListExpr*>(&expr)) {
+        Value val = evaluateInternal(*arg->expr, row, context);
+        if (val.isNull()) return Value();
+        bool found = false;
+        for (const auto& listExpr : arg->list) {
+            Value listVal = evaluateInternal(*listExpr, row, context);
+            if (val == listVal) {
+                found = true;
+                break;
+            }
+        }
+        return Value(arg->isNot ? (found ? 0 : 1) : (found ? 1 : 0));
+    } else if (const auto* arg = dynamic_cast<const LikeExpr*>(&expr)) {
+        Value val = evaluateInternal(*arg->expr, row, context);
+        Value pat = evaluateInternal(*arg->pattern, row, context);
+        if (val.isNull() || pat.isNull()) {
+            return Value();
+        }
+        if (val.type() == DataType::VARCHAR && pat.type() == DataType::VARCHAR) {
+            bool matches = likeMatch(pat.toVarchar(), val.toVarchar());
+            return Value(arg->isNot ? (matches ? 0 : 1) : (matches ? 1 : 0));
+        }
+        throw ExecutionError("LIKE requires string operands");
+    } else if (dynamic_cast<const FunctionCallExpr*>(&expr)) {
+        throw ExecutionError("Aggregates not evaluable directly here");
+    }
+    return Value();
 }
 
 bool Evaluator::likeMatch(const QString& pattern, const QString& text) {
