@@ -68,7 +68,7 @@ Inside the CLI, you can use `.help` to see available meta-commands (like `.table
 - **Joins**: `INNER JOIN`, `LEFT JOIN`
 - **Aggregates**: `COUNT()`, `SUM()`, `AVG()`, `MIN()`, `MAX()`
 - **Operators**: `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `LIKE`, `IS NULL`, `IS NOT NULL`, `BETWEEN`, `IN`
-- **Utility**: `SHOW TABLES`, `DESCRIBE <table>`
+- **Utility**: `SHOW TABLES`, `DESCRIBE <table>` 
 
 ## License
-MIT
+No license it is open source
